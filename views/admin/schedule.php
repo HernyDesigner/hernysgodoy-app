@@ -371,6 +371,7 @@ function exceptionBadgeClass($type): string
                 <h2>Horarios laborales</h2>
 
                 <form method="POST" action="<?= APP_URL ?>/schedule/update-hours">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
 
                     <div class="table-wrapper">
                         <table class="hours-table">
