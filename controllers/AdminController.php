@@ -2549,9 +2549,16 @@ public function confirmedMessagesBulk(): void
 public function sendConfirmedWhatsApp(): void
 {
     Auth::requireLogin();
+    Auth::startSession();
+
+    $csrfToken = $_POST['csrf_token'] ?? null;
+
+    if (!Auth::validateCsrfToken($csrfToken)) {
+        $this->redirectWithError('La sesión del formulario venció. Volvé a intentarlo.');
+    }
 
     $businessId = $this->getBusinessId();
-    $appointmentId = (int) ($_GET['id'] ?? 0);
+    $appointmentId = (int) ($_POST['appointment_id'] ?? 0);
 
     if ($appointmentId <= 0) {
         $this->redirectWithError('Turno inválido.');

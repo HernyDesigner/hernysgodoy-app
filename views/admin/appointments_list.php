@@ -441,13 +441,19 @@ $isPendingApprovalList = $type === 'pending_approval';
                                     </a>
 
                                     <?php if (($appointment['status'] ?? '') === 'confirmed'): ?>
-                                        <a
-                                            href="<?= APP_URL ?>/appointments/send-confirmed-whatsapp?id=<?= h($appointment['id']) ?>"
-                                            class="btn"
+                                        <form
+                                            method="POST"
+                                            action="<?= APP_URL ?>/appointments/send-confirmed-whatsapp"
                                             target="_blank"
+                                            style="margin:0;"
                                         >
-                                            WhatsApp confirmado
-                                        </a>
+                                            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+                                            <input type="hidden" name="appointment_id" value="<?= h($appointment['id']) ?>">
+
+                                            <button type="submit" class="btn">
+                                                WhatsApp confirmado
+                                            </button>
+                                        </form>
                                     <?php endif; ?>
 
                                 </div>
