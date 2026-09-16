@@ -420,6 +420,7 @@ $isPendingApprovalList = $type === 'pending_approval';
                                             action="<?= APP_URL ?>/appointments/confirm"
                                             onsubmit="return confirm('¿Confirmar este turno?');"
                                         >
+                                            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
                                             <input
                                                 type="hidden"
                                                 name="appointment_id"

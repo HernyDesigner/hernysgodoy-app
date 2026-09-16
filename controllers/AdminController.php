@@ -1047,6 +1047,14 @@
         Auth::requireLogin();
         Auth::startSession();
 
+        $csrfToken = $_POST['csrf_token'] ?? null;
+
+        if (!Auth::validateCsrfToken($csrfToken)) {
+            $_SESSION['flash_error'] = 'La sesión del formulario venció. Volvé a intentarlo.';
+            header('Location: ' . APP_URL . '/appointments/pending-approval');
+            exit;
+        }
+
         $businessId = $this->getCurrentBusinessId();
         $appointmentId = (int) ($_POST['appointment_id'] ?? 0);
 
