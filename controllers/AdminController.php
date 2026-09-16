@@ -2043,6 +2043,13 @@ public function createProfessional(): void
 public function storeProfessional(): void
 {
     Auth::requireLogin();
+    Auth::startSession();
+
+    $csrfToken = $_POST['csrf_token'] ?? null;
+
+    if (!Auth::validateCsrfToken($csrfToken)) {
+        $this->redirectWithError('La sesión del formulario venció. Volvé a intentarlo.');
+    }
 
     $businessId = $this->getBusinessId();
 
@@ -2138,6 +2145,13 @@ public function editProfessional(): void
 public function updateProfessional(): void
 {
     Auth::requireLogin();
+    Auth::startSession();
+
+    $csrfToken = $_POST['csrf_token'] ?? null;
+
+    if (!Auth::validateCsrfToken($csrfToken)) {
+        $this->redirectWithError('La sesión del formulario venció. Volvé a intentarlo.');
+    }
 
     $businessId = $this->getBusinessId();
     $professionalId = (int) ($_POST['professional_id'] ?? 0);

@@ -243,6 +243,7 @@ function professionalChecked(array $professional, string $key, bool $default = f
     </section>
 
     <form method="POST" action="<?= h($formAction) ?>">
+        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
         <?php if (!empty($professional['id'])): ?>
             <input type="hidden" name="professional_id" value="<?= h($professional['id']) ?>">
         <?php endif; ?>
