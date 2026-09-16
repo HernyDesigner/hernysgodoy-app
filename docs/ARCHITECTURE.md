@@ -38,6 +38,9 @@ https://hernysgodoy.com/app/
 - `setup/`
   Scripts de instalación o inicialización.
   No deben ejecutarse automáticamente.
+  Los archivos de `setup/` pueden existir localmente sin estar versionados.
+  En particular, `setup/create_users.php` está excluido mediante `.gitignore`
+  y no debe considerarse parte del repositorio ni desplegarse automáticamente.
 
 - `views/admin/`
   Vistas del backoffice.
