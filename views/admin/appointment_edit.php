@@ -246,6 +246,8 @@ $appointmentTime = date('H:i', strtotime($appointment['start_at']));
 
         <form method="POST" action="<?= APP_URL ?>/appointments/update" id="editAppointmentForm">
 
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+
             <input type="hidden" name="appointment_id" value="<?= h($appointment['id']) ?>">
 
             <div class="form-grid">

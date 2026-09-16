@@ -304,6 +304,21 @@
         Auth::requireLogin();
         Auth::startSession();
 
+        $csrfToken = $_POST['csrf_token'] ?? null;
+
+        if (!Auth::validateCsrfToken($csrfToken)) {
+            $appointmentId = (int) ($_POST['appointment_id'] ?? 0);
+
+            if ($appointmentId > 0) {
+                $this->redirectEditWithError(
+                    $appointmentId,
+                    'La sesión del formulario venció. Volvé a intentarlo.'
+                );
+            }
+
+            die('Token CSRF inválido.');
+        }
+
         $businessId = $this->getCurrentBusinessId();
 
         $appointmentId = (int) ($_POST['appointment_id'] ?? 0);
