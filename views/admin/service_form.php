@@ -285,6 +285,7 @@ $durationType = $field('duration_type', 'fixed');
         <?php endif; ?>
 
         <form method="POST" action="<?= h($formAction) ?>">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
 
             <?php if ($isEdit): ?>
                 <input type="hidden" name="service_id" value="<?= h($field('id')) ?>">

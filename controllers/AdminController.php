@@ -557,6 +557,14 @@
         Auth::requireLogin();
         Auth::startSession();
 
+        $csrfToken = $_POST['csrf_token'] ?? null;
+
+        if (!Auth::validateCsrfToken($csrfToken)) {
+            $_SESSION['flash_error'] = 'La sesión del formulario venció. Volvé a intentarlo.';
+            header('Location: ' . APP_URL . '/services/create');
+            exit;
+        }
+
         $businessId = $this->getCurrentBusinessId();
 
         $_SESSION['flash_old'] = $_POST;
@@ -672,6 +680,20 @@
     {
         Auth::requireLogin();
         Auth::startSession();
+
+        $csrfToken = $_POST['csrf_token'] ?? null;
+
+        if (!Auth::validateCsrfToken($csrfToken)) {
+            $serviceId = (int) ($_POST['service_id'] ?? 0);
+
+            if ($serviceId > 0) {
+                $_SESSION['flash_error'] = 'La sesión del formulario venció. Volvé a intentarlo.';
+                header('Location: ' . APP_URL . '/services/edit?id=' . $serviceId);
+                exit;
+            }
+
+            die('Token CSRF inválido.');
+        }
 
         $businessId = $this->getCurrentBusinessId();
 
