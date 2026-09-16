@@ -235,6 +235,7 @@ function serviceLabel(array $service): string
         </div>
 
         <form method="POST" action="<?= APP_URL ?>/appointments/store">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
 
             <div class="form-grid">
 

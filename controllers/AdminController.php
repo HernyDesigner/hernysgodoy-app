@@ -58,6 +58,12 @@
         Auth::requireLogin();
         Auth::startSession();
 
+        $csrfToken = $_POST['csrf_token'] ?? null;
+
+        if (!Auth::validateCsrfToken($csrfToken)) {
+            $this->redirectWithError('La sesión del formulario venció. Volvé a intentarlo.');
+        }
+
         $businessId = $this->getCurrentBusinessId();
 
         $customerName = trim($_POST['customer_name'] ?? '');
