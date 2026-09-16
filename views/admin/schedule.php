@@ -453,6 +453,7 @@ function exceptionBadgeClass($type): string
                 <h2>Agregar bloqueo / excepción</h2>
 
                 <form method="POST" action="<?= APP_URL ?>/schedule/exceptions/store">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
 
                     <div class="field">
                         <label for="date">Fecha *</label>
