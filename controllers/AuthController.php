@@ -16,6 +16,14 @@ class AuthController
     {
         Auth::startSession();
 
+        $csrfToken = $_POST['csrf_token'] ?? null;
+
+        if (!Auth::validateCsrfToken($csrfToken)) {
+            $_SESSION['flash_error'] = 'La sesión del formulario venció. Volvé a intentarlo.';
+            header('Location: ' . APP_URL . '/login');
+            exit;
+        }
+
         $email = trim($_POST['email'] ?? '');
         $password = $_POST['password'] ?? '';
 

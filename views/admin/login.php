@@ -99,6 +99,7 @@ unset($_SESSION['flash_error']);
     <?php endif; ?>
 
     <form method="POST" action="<?= APP_URL ?>/login">
+        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
         <label for="email">Email</label>
         <input type="email" name="email" id="email" required>
 
