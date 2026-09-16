@@ -171,6 +171,7 @@
             <a href="<?= APP_URL ?>/calendar" class="btn secondary">Volver al calendario</a>
         <?php else: ?>
             <form method="POST" action="<?= APP_URL ?>/appointments/confirmed-messages/bulk">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
                 <div class="actions-top">
                     <button type="button" class="btn secondary" id="selectAllBtn">Seleccionar todos</button>
                     <button type="submit" class="btn">Preparar mensajes seleccionados</button>
