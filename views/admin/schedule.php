@@ -535,6 +535,7 @@ function exceptionBadgeClass($type): string
                                     onsubmit="return confirm('¿Seguro querés eliminar este bloqueo?');"
                                     style="margin-top:12px;"
                                 >
+                                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(Auth::csrfToken(), ENT_QUOTES, 'UTF-8') ?>">
                                     <input type="hidden" name="exception_id" value="<?= h($exception['id']) ?>">
                                     <button type="submit" class="btn danger">Eliminar</button>
                                 </form>
