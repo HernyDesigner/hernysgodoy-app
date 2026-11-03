@@ -41,17 +41,17 @@ class Availability
 
         $blocksFullSchedule = (int) ($service['blocks_full_schedule'] ?? 1) === 1;
 
-        if ($this->isBlockedDay($businessId, $date)) {
+        if ($this->isBlockedDay($businessId, $date, $professionalId)) {
             return [];
         }
 
-        $workingIntervals = $this->getWorkingIntervals($businessId, $date);
+        $workingIntervals = $this->getWorkingIntervals($businessId, $date, $professionalId);
 
         if (empty($workingIntervals)) {
             return [];
         }
 
-        $blockedIntervals = $this->getBlockedIntervals($businessId, $date);
+        $blockedIntervals = $this->getBlockedIntervals($businessId, $date, $professionalId);
         $fullBlockingAppointments = $this->getFullBlockingAppointmentIntervals(
             $businessId,
             $date,
@@ -68,6 +68,11 @@ class Availability
             $end = strtotime($date . ' ' . $interval['end']);
 
             while (($current + ($duration * 60)) <= $end) {
+                // Omitir horarios cuyo inicio ya pasó.
+                if ($current <= time()) {
+                    $current += $this->slotInterval * 60;
+                    continue;
+                }
                 $slotStart = date('H:i:s', $current);
                 $slotEnd = date('H:i:s', $current + ($duration * 60));
 
@@ -78,7 +83,9 @@ class Availability
                 }
 
                 if ($isAvailable) {
-                    if ($blocksFullSchedule) {
+                    // Una profesional concreta no puede atender turnos superpuestos,
+                    // aunque el servicio admita capacidad simultanea.
+                    if ($professionalId !== null || $blocksFullSchedule) {
                         $totalOverlaps = $this->countAllOverlappingAppointments(
                             $businessId,
                             $date,
@@ -139,24 +146,51 @@ class Availability
         return $service ?: null;
     }
 
-    private function getWorkingIntervals(int $businessId, string $date): array
+    private function getWorkingIntervals(
+        int $businessId,
+        string $date,
+        ?int $professionalId = null
+    ): array
     {
         $weekday = (int) date('w', strtotime($date));
         $intervals = [];
+        $hours = null;
 
-        $stmt = $this->db->prepare("
-            SELECT *
-            FROM business_hours
-            WHERE business_id = ?
-              AND weekday = ?
-              AND is_active = 1
-            LIMIT 1
-        ");
+        if ($professionalId !== null) {
+            $ownHours = $this->db->prepare("
+                SELECT *
+                FROM business_hours
+                WHERE business_id = ?
+                  AND professional_id = ?
+                  AND weekday = ?
+                ORDER BY id DESC
+                LIMIT 1
+            ");
 
-        $stmt->execute([$businessId, $weekday]);
-        $hours = $stmt->fetch();
+            $ownHours->execute([$businessId, $professionalId, $weekday]);
+            $hours = $ownHours->fetch() ?: null;
 
-        if ($hours) {
+            if ($hours && (int) $hours['is_active'] !== 1) {
+                return [];
+            }
+        }
+
+        if (!$hours) {
+            $stmt = $this->db->prepare("
+                SELECT *
+                FROM business_hours
+                WHERE business_id = ?
+                  AND professional_id IS NULL
+                  AND weekday = ?
+                ORDER BY id DESC
+                LIMIT 1
+            ");
+
+            $stmt->execute([$businessId, $weekday]);
+            $hours = $stmt->fetch() ?: null;
+        }
+
+        if ($hours && (int) $hours['is_active'] === 1) {
             $start = $hours['start_time'];
             $end = $hours['end_time'];
             $breakStart = $hours['break_start'];
@@ -184,16 +218,27 @@ class Availability
             }
         }
 
+        $scopeSql = $professionalId === null
+            ? 'AND professional_id IS NULL'
+            : 'AND (professional_id IS NULL OR professional_id = ?)';
+
         $extraHours = $this->db->prepare("
             SELECT start_time, end_time
             FROM schedule_exceptions
             WHERE business_id = ?
               AND date = ?
               AND type = 'extra_hours'
+              {$scopeSql}
             ORDER BY start_time ASC
         ");
 
-        $extraHours->execute([$businessId, $date]);
+        $extraParams = [$businessId, $date];
+
+        if ($professionalId !== null) {
+            $extraParams[] = $professionalId;
+        }
+
+        $extraHours->execute($extraParams);
 
         foreach ($extraHours->fetchAll() as $extra) {
             if ($extra['start_time'] && $extra['end_time']) {
@@ -207,24 +252,47 @@ class Availability
         return $intervals;
     }
 
-    private function isBlockedDay(int $businessId, string $date): bool
+    private function isBlockedDay(
+        int $businessId,
+        string $date,
+        ?int $professionalId = null
+    ): bool
     {
+        $scopeSql = $professionalId === null
+            ? 'AND professional_id IS NULL'
+            : 'AND (professional_id IS NULL OR professional_id = ?)';
+
         $stmt = $this->db->prepare("
             SELECT COUNT(*) AS total
             FROM schedule_exceptions
             WHERE business_id = ?
               AND date = ?
               AND type = 'blocked_day'
+              {$scopeSql}
         ");
 
-        $stmt->execute([$businessId, $date]);
+        $params = [$businessId, $date];
+
+        if ($professionalId !== null) {
+            $params[] = $professionalId;
+        }
+
+        $stmt->execute($params);
         $row = $stmt->fetch();
 
         return (int) $row['total'] > 0;
     }
 
-    private function getBlockedIntervals(int $businessId, string $date): array
+    private function getBlockedIntervals(
+        int $businessId,
+        string $date,
+        ?int $professionalId = null
+    ): array
     {
+        $scopeSql = $professionalId === null
+            ? 'AND professional_id IS NULL'
+            : 'AND (professional_id IS NULL OR professional_id = ?)';
+
         $stmt = $this->db->prepare("
             SELECT start_time, end_time
             FROM schedule_exceptions
@@ -233,10 +301,17 @@ class Availability
               AND type = 'blocked_range'
               AND start_time IS NOT NULL
               AND end_time IS NOT NULL
+              {$scopeSql}
             ORDER BY start_time ASC
         ");
 
-        $stmt->execute([$businessId, $date]);
+        $params = [$businessId, $date];
+
+        if ($professionalId !== null) {
+            $params[] = $professionalId;
+        }
+
+        $stmt->execute($params);
 
         $intervals = [];
 
@@ -264,7 +339,7 @@ class Availability
             FROM appointments a
             INNER JOIN services s ON s.id = a.service_id
             WHERE a.business_id = ?
-              AND a.status NOT IN ('cancelled')
+              AND (a.status IS NULL OR a.status <> 'cancelled')
               AND s.blocks_full_schedule = 1
               AND a.start_at <= ?
               AND a.end_at >= ?
@@ -358,7 +433,7 @@ class Availability
             FROM appointments a
             INNER JOIN services s ON s.id = a.service_id
             WHERE a.business_id = ?
-              AND a.status NOT IN ('cancelled')
+              AND (a.status IS NULL OR a.status <> 'cancelled')
               AND a.start_at < ?
               AND a.end_at > ?
         ";

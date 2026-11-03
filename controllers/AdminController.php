@@ -14,11 +14,12 @@
             Auth::requireLogin();
 
             $businessId = $this->getCurrentBusinessId();
+            $professionalId = $this->getCurrentProfessionalId();
 
             $business = $this->getBusiness($businessId);
-            $stats = $this->getDashboardStats($businessId);
-            $todayAppointments = $this->getTodayAppointments($businessId);
-            $upcomingAppointments = $this->getUpcomingAppointments($businessId);
+            $stats = $this->getDashboardStats($businessId, $professionalId);
+            $todayAppointments = $this->getTodayAppointments($businessId, $professionalId);
+            $upcomingAppointments = $this->getUpcomingAppointments($businessId, $professionalId);
 
             require __DIR__ . '/../views/admin/dashboard.php';
         }
@@ -26,9 +27,14 @@
         public function calendar(): void
         {
             Auth::requireLogin();
+            Auth::startSession();
 
             $businessId = $this->getCurrentBusinessId();
             $business = $this->getBusiness($businessId);
+            $createResult = $this->consumeAppointmentCreateResult(
+                $_GET['create_result'] ?? null
+            );
+            $success = $createResult['success'] ?? null;
 
             require __DIR__ . '/../views/admin/calendar.php';
         }
@@ -38,17 +44,19 @@
         Auth::requireLogin();
 
         $businessId = $this->getCurrentBusinessId();
+        $professionalId = $this->getCurrentProfessionalId();
         $business = $this->getBusiness($businessId);
-        $services = $this->getActiveServices($businessId);
-        $professionals = $this->getActiveProfessionals($businessId);
+        $services = $this->getActiveServices($businessId, $professionalId);
+        $professionals = $this->getActiveProfessionals($businessId, $professionalId);
 
         Auth::startSession();
 
-        $error = $_SESSION['flash_error'] ?? null;
-        $success = $_SESSION['flash_success'] ?? null;
-        $old = $_SESSION['flash_old'] ?? [];
-
-        unset($_SESSION['flash_error'], $_SESSION['flash_success'], $_SESSION['flash_old']);
+        $createResult = $this->consumeAppointmentCreateResult($_GET['result'] ?? null);
+        $error = $createResult['error'] ?? null;
+        $success = $createResult['success'] ?? null;
+        $old = isset($createResult['old']) && is_array($createResult['old'])
+            ? $createResult['old']
+            : [];
 
         require __DIR__ . '/../views/admin/appointment_create.php';
     }
@@ -58,47 +66,56 @@
         Auth::requireLogin();
         Auth::startSession();
 
+        $createResultId = bin2hex(random_bytes(16));
         $csrfToken = $_POST['csrf_token'] ?? null;
 
         if (!Auth::validateCsrfToken($csrfToken)) {
-            $this->redirectWithError('La sesión del formulario venció. Volvé a intentarlo.');
+            $this->redirectAppointmentCreateWithError(
+                $createResultId,
+                'La sesión del formulario venció. Volvé a intentarlo.'
+            );
         }
 
         $businessId = $this->getCurrentBusinessId();
+        $scopedProfessionalId = $this->getCurrentProfessionalId();
 
         $customerName = trim($_POST['customer_name'] ?? '');
         $customerPhone = preg_replace('/\D+/', '', $_POST['customer_phone'] ?? '');
         $serviceId = (int) ($_POST['service_id'] ?? 0);
-        $professionalId = (int) ($_POST['professional_id'] ?? 0);
+        $professionalId = $scopedProfessionalId ?? (int) ($_POST['professional_id'] ?? 0);
         $date = trim($_POST['date'] ?? '');
         $time = trim($_POST['time'] ?? '');
-        $status = trim($_POST['status'] ?? 'confirmed');
+        $status = trim($_POST['status'] ?? 'pending_approval');
         $originChannel = trim($_POST['origin_channel'] ?? 'manual');
         $customerNotes = trim($_POST['customer_notes'] ?? '');
         $internalNotes = trim($_POST['internal_notes'] ?? '');
 
-        $_SESSION['flash_old'] = $_POST;
-
         if ($customerName === '') {
-            $this->redirectWithError('El nombre del cliente es obligatorio.');
+            $this->redirectAppointmentCreateWithError(
+                $createResultId,
+                'El nombre del cliente es obligatorio.'
+            );
         }
 
         if ($customerPhone === '') {
-            $this->redirectWithError('El WhatsApp del cliente es obligatorio.');
+            $this->redirectAppointmentCreateWithError(
+                $createResultId,
+                'El WhatsApp del cliente es obligatorio.'
+            );
         }
 
         if ($serviceId <= 0) {
-            $this->redirectWithError('Seleccioná un servicio.');
+            $this->redirectAppointmentCreateWithError($createResultId, 'Seleccioná un servicio.');
         }
 
         if ($date === '' || $time === '') {
-            $this->redirectWithError('Seleccioná fecha y hora.');
+            $this->redirectAppointmentCreateWithError($createResultId, 'Seleccioná fecha y hora.');
         }
 
         $allowedStatuses = [
             'pending_approval',
             'pending_deposit',
-            'confirmed',
+            'approved',
             'completed',
             'cancelled',
             'rescheduled',
@@ -107,7 +124,7 @@
         ];
 
         if (!in_array($status, $allowedStatuses, true)) {
-            $this->redirectWithError('Estado de turno inválido.');
+            $this->redirectAppointmentCreateWithError($createResultId, 'Estado de turno inválido.');
         }
 
         $allowedOrigins = [
@@ -125,7 +142,10 @@
         $service = $this->getService($businessId, $serviceId);
 
         if (!$service) {
-            $this->redirectWithError('El servicio seleccionado no existe.');
+            $this->redirectAppointmentCreateWithError(
+                $createResultId,
+                'El servicio seleccionado no existe.'
+            );
         }
 
         if ($professionalId <= 0) {
@@ -133,14 +153,40 @@
             }
 
             if (!$this->professionalCanDoService($businessId, $professionalId, $serviceId)) {
-                $this->redirectWithError('El profesional seleccionado no está asignado a este servicio.');
+                $this->redirectAppointmentCreateWithError(
+                    $createResultId,
+                    'El profesional seleccionado no está asignado a este servicio.'
+                );
             }
 
-        $startAt = $date . ' ' . $time . ':00';
+        $businessTimeZone = new DateTimeZone('America/Argentina/Buenos_Aires');
+        $startInput = $date . ' ' . $time;
+        $appointmentStart = DateTimeImmutable::createFromFormat(
+            '!Y-m-d H:i',
+            $startInput,
+            $businessTimeZone
+        );
+        $startErrors = DateTimeImmutable::getLastErrors();
 
-        if (strtotime($startAt) === false) {
-            $this->redirectWithError('La fecha u hora no es válida.');
+        if (
+            !$appointmentStart
+            || ($startErrors !== false && ($startErrors['warning_count'] > 0 || $startErrors['error_count'] > 0))
+            || $appointmentStart->format('Y-m-d H:i') !== $startInput
+        ) {
+            $this->redirectAppointmentCreateWithError(
+                $createResultId,
+                'La fecha u hora no es válida.'
+            );
         }
+
+        if ($appointmentStart <= new DateTimeImmutable('now', $businessTimeZone)) {
+            $this->redirectAppointmentCreateWithError(
+                $createResultId,
+                'No podés crear un turno en una fecha u hora que ya pasó.'
+            );
+        }
+
+        $startAt = $appointmentStart->format('Y-m-d H:i:s');
 
         $duration = (int) $service['duration_default'];
 
@@ -148,7 +194,9 @@
             $duration = 60;
         }
 
-        $endAt = date('Y-m-d H:i:s', strtotime($startAt . " + {$duration} minutes"));
+        $endAt = $appointmentStart
+            ->modify("+{$duration} minutes")
+            ->format('Y-m-d H:i:s');
 
         $availability = new Availability();
 
@@ -170,16 +218,28 @@
         }
 
         if (!$slotAvailable) {
-            $this->redirectWithError('Ese horario ya no está disponible para el profesional seleccionado.');
+            $this->redirectAppointmentCreateWithError(
+                $createResultId,
+                'Ese horario ya no está disponible para el profesional seleccionado.'
+            );
         }
 
         try {
             $this->db->beginTransaction();
 
+            if ($appointmentStart <= new DateTimeImmutable('now', $businessTimeZone)) {
+                throw new RuntimeException('El horario seleccionado ya pasó. Elegí uno futuro.');
+            }
+
+            if (!$this->professionalCanDoService($businessId, $professionalId, $serviceId)) {
+                throw new RuntimeException('El profesional ya no está asignado a este servicio.');
+            }
+
             $customerId = $this->findOrCreateCustomer(
                 $businessId,
                 $customerName,
-                $customerPhone
+                $customerPhone,
+                $scopedProfessionalId === null
             );
 
             $depositRequired = (int) $service['requires_deposit'];
@@ -250,18 +310,22 @@
             ]);
 
             $this->db->commit();
+            $this->storeAppointmentCreateResult($createResultId, [
+                'success' => 'Turno creado correctamente.',
+            ]);
 
-            unset($_SESSION['flash_old']);
-
-            $_SESSION['flash_success'] = 'Turno creado correctamente.';
-
-            header('Location: ' . APP_URL . '/calendar');
+            header(
+                'Location: ' . APP_URL . '/calendar?create_result=' . rawurlencode($createResultId)
+            );
             exit;
 
         } catch (Exception $e) {
             $this->db->rollBack();
 
-            $this->redirectWithError('Error al crear el turno: ' . $e->getMessage());
+            $this->redirectAppointmentCreateWithError(
+                $createResultId,
+                'Error al crear el turno: ' . $e->getMessage()
+            );
         }
     }
 
@@ -271,6 +335,7 @@
         Auth::startSession();
 
         $businessId = $this->getCurrentBusinessId();
+        $professionalId = $this->getCurrentProfessionalId();
         $business = $this->getBusiness($businessId);
 
         $appointmentId = (int) ($_GET['id'] ?? 0);
@@ -279,16 +344,22 @@
             die('ID de turno inválido.');
         }
 
-        $appointment = $this->getAppointment($businessId, $appointmentId);
+        $appointment = $this->getAppointment($businessId, $appointmentId, $professionalId);
 
         if (!$appointment) {
             die('No se encontró el turno.');
         }
 
-        $services = $this->getActiveServices($businessId);
+        $canCancelAppointment = $this->canCancelAppointmentStatus($appointment['status']);
+        $cancellationWhatsAppUrl = $appointment['status'] === 'cancelled'
+            ? $this->buildCancellationWhatsAppUrl($appointment)
+            : null;
+
+        $services = $this->getActiveServices($businessId, $professionalId);
         $professionals = $this->getProfessionalsForService(
             $businessId,
-            (int) $appointment['service_id']
+            (int) $appointment['service_id'],
+            $professionalId
         );
 
         $error = $_SESSION['flash_error'] ?? null;
@@ -320,6 +391,7 @@
         }
 
         $businessId = $this->getCurrentBusinessId();
+        $scopedProfessionalId = $this->getCurrentProfessionalId();
 
         $appointmentId = (int) ($_POST['appointment_id'] ?? 0);
 
@@ -327,29 +399,36 @@
             die('ID de turno inválido.');
         }
 
-        $appointment = $this->getAppointment($businessId, $appointmentId);
+        $appointment = $this->getAppointment($businessId, $appointmentId, $scopedProfessionalId);
 
         if (!$appointment) {
             die('No se encontró el turno.');
         }
 
-        $customerName = trim($_POST['customer_name'] ?? '');
-        $customerPhone = preg_replace('/\D+/', '', $_POST['customer_phone'] ?? '');
+        if ($scopedProfessionalId !== null) {
+            $customerName = (string) $appointment['customer_name'];
+            $customerPhone = (string) $appointment['customer_phone'];
+        } else {
+            $customerName = trim($_POST['customer_name'] ?? '');
+            $customerPhone = preg_replace('/\D+/', '', $_POST['customer_phone'] ?? '');
+        }
         $serviceId = (int) ($_POST['service_id'] ?? 0);
-        $professionalId = (int) ($_POST['professional_id'] ?? 0);
+        $professionalId = $scopedProfessionalId ?? (int) ($_POST['professional_id'] ?? 0);
         $date = trim($_POST['date'] ?? '');
         $time = trim($_POST['time'] ?? '');
-        $status = trim($_POST['status'] ?? 'confirmed');
+        $status = trim($_POST['status'] ?? $appointment['status']);
         $originChannel = trim($_POST['origin_channel'] ?? 'manual');
         $customerNotes = trim($_POST['customer_notes'] ?? '');
         $internalNotes = trim($_POST['internal_notes'] ?? '');
 
-        if ($customerName === '') {
-            $this->redirectEditWithError($appointmentId, 'El nombre del cliente es obligatorio.');
-        }
+        if ($scopedProfessionalId === null) {
+            if ($customerName === '') {
+                $this->redirectEditWithError($appointmentId, 'El nombre del cliente es obligatorio.');
+            }
 
-        if ($customerPhone === '') {
-            $this->redirectEditWithError($appointmentId, 'El WhatsApp del cliente es obligatorio.');
+            if ($customerPhone === '') {
+                $this->redirectEditWithError($appointmentId, 'El WhatsApp del cliente es obligatorio.');
+            }
         }
 
         if ($serviceId <= 0) {
@@ -371,6 +450,7 @@
         $allowedStatuses = [
             'pending_approval',
             'pending_deposit',
+            'approved',
             'confirmed',
             'completed',
             'cancelled',
@@ -381,6 +461,10 @@
 
         if (!in_array($status, $allowedStatuses, true)) {
             $this->redirectEditWithError($appointmentId, 'Estado inválido.');
+        }
+
+        if ($status === 'confirmed' && $appointment['status'] !== 'confirmed') {
+            $this->redirectEditWithError($appointmentId, 'Confirmá el envío desde la acción de WhatsApp.');
         }
 
         $allowedOrigins = [
@@ -443,11 +527,63 @@
         try {
             $this->db->beginTransaction();
 
-            $customerId = $this->findOrCreateCustomer(
-                $businessId,
-                $customerName,
-                $customerPhone
-            );
+            $lockSql = "
+                SELECT status, cancelled_at, customer_id, start_at FROM appointments
+                WHERE id = ? AND business_id = ?
+            ";
+            $lockParams = [$appointmentId, $businessId];
+
+            if ($scopedProfessionalId !== null) {
+                $lockSql .= " AND professional_id = ?";
+                $lockParams[] = $scopedProfessionalId;
+            }
+
+            $lockSql .= " FOR UPDATE";
+
+            $lock = $this->db->prepare($lockSql);
+            $lock->execute($lockParams);
+            $current = $lock->fetch();
+
+            if (!$current || $current['status'] !== $appointment['status']) {
+                throw new RuntimeException('El estado del turno cambió. Recargá el formulario.');
+            }
+
+            $currentStatus = (string) $current['status'];
+            $currentStartTimestamp = strtotime((string) $current['start_at']);
+            $requestedStartTimestamp = strtotime($startAt);
+            $scheduleChanged = $currentStartTimestamp === false
+                || $requestedStartTimestamp === false
+                || date('Y-m-d H:i', $currentStartTimestamp) !== date('Y-m-d H:i', $requestedStartTimestamp);
+
+            if ($currentStatus === 'confirmed' && $status === 'confirmed' && $scheduleChanged) {
+                $status = 'approved';
+            }
+
+            if (!$this->professionalCanDoService($businessId, $professionalId, $serviceId)) {
+                throw new RuntimeException('El profesional ya no está asignado a este servicio.');
+            }
+
+            if (
+                $status === 'cancelled'
+                && $currentStatus !== 'cancelled'
+                && !$this->canCancelAppointmentStatus($currentStatus)
+            ) {
+                throw new RuntimeException('Los turnos completados o marcados como no asistió no pueden cancelarse.');
+            }
+
+            if ($scopedProfessionalId !== null) {
+                $customerId = (int) $current['customer_id'];
+
+                if ($customerId <= 0) {
+                    throw new RuntimeException('El turno no tiene una clienta válida asociada.');
+                }
+            } else {
+                $customerId = $this->findOrCreateCustomer(
+                    $businessId,
+                    $customerName,
+                    $customerPhone
+                );
+            }
 
             $depositRequired = (int) $service['requires_deposit'];
             $depositStatus = $depositRequired ? ($_POST['deposit_status'] ?? 'pending') : 'not_required';
@@ -460,9 +596,15 @@
                 $depositStatus = $depositRequired ? 'pending' : 'not_required';
             }
 
-            $cancelledAt = $status === 'cancelled' ? date('Y-m-d H:i:s') : null;
+            $cancelledAt = null;
 
-            $stmt = $this->db->prepare("
+            if ($status === 'cancelled') {
+                $cancelledAt = $currentStatus === 'cancelled'
+                    ? $current['cancelled_at']
+                    : date('Y-m-d H:i:s');
+            }
+
+            $updateSql = "
                 UPDATE appointments
                 SET
                     customer_id = ?,
@@ -481,9 +623,9 @@
                     cancelled_at = ?
                 WHERE id = ?
                   AND business_id = ?
-            ");
+            ";
 
-            $stmt->execute([
+            $updateParams = [
                 $customerId,
                 $serviceId,
                 $professionalId,
@@ -500,7 +642,15 @@
                 $cancelledAt,
                 $appointmentId,
                 $businessId
-            ]);
+            ];
+
+            if ($scopedProfessionalId !== null) {
+                $updateSql .= " AND professional_id = ?";
+                $updateParams[] = $scopedProfessionalId;
+            }
+
+            $stmt = $this->db->prepare($updateSql);
+            $stmt->execute($updateParams);
 
             $this->db->commit();
 
@@ -784,14 +934,25 @@
 
     public function schedule(): void
     {
-        Auth::requireLogin();
+        Auth::requireScheduleAccess();
         Auth::startSession();
 
         $businessId = $this->getCurrentBusinessId();
         $business = $this->getBusiness($businessId);
+        $scheduleProfessionalId = $this->resolveScheduleProfessionalId(
+            $businessId,
+            $_GET['professional_id'] ?? null
+        );
+        $canSelectScheduleScope = Auth::isAdministrator();
+        $scheduleProfessionals = $canSelectScheduleScope
+            ? $this->getScheduleProfessionals($businessId)
+            : [];
+        $scheduleProfessional = $scheduleProfessionalId !== null
+            ? $this->getScheduleProfessional($businessId, $scheduleProfessionalId)
+            : null;
 
-        $businessHours = $this->getBusinessHoursMap($businessId);
-        $exceptions = $this->getScheduleExceptions($businessId);
+        $businessHours = $this->getBusinessHoursMap($businessId, $scheduleProfessionalId);
+        $exceptions = $this->getScheduleExceptions($businessId, $scheduleProfessionalId);
 
         $error = $_SESSION['flash_error'] ?? null;
         $success = $_SESSION['flash_success'] ?? null;
@@ -803,7 +964,7 @@
 
     public function updateBusinessHours(): void
     {
-        Auth::requireLogin();
+        Auth::requireScheduleAccess();
         Auth::startSession();
 
         $csrfToken = $_POST['csrf_token'] ?? null;
@@ -815,11 +976,39 @@
         }
 
         $businessId = $this->getCurrentBusinessId();
+        $scheduleProfessionalId = $this->resolveScheduleProfessionalId(
+            $businessId,
+            $_POST['professional_id'] ?? null
+        );
+        $redirectUrl = $this->getScheduleUrl($scheduleProfessionalId);
         $hours = $_POST['hours'] ?? [];
 
         try {
+            if (!is_array($hours)) {
+                throw new RuntimeException('Los horarios enviados no son válidos.');
+            }
+
+            $preparedHours = [];
+
             foreach (range(0, 6) as $weekday) {
                 $row = $hours[$weekday] ?? [];
+
+                if (!is_array($row)) {
+                    throw new RuntimeException('Los horarios enviados no son válidos.');
+                }
+
+                $mode = $scheduleProfessionalId !== null
+                    ? (string) ($row['mode'] ?? '')
+                    : 'custom';
+
+                if ($scheduleProfessionalId !== null && $mode === 'inherit') {
+                    $preparedHours[$weekday] = ['mode' => 'inherit'];
+                    continue;
+                }
+
+                if ($mode !== 'custom') {
+                    throw new RuntimeException('El modo de horario seleccionado no es válido.');
+                }
 
                 $isActive = isset($row['is_active']) ? 1 : 0;
 
@@ -863,19 +1052,63 @@
                     $endTime = '18:00:00';
                 }
 
-                $existing = $this->db->prepare("
-                    SELECT id
-                    FROM business_hours
-                    WHERE business_id = ?
-                      AND weekday = ?
-                    ORDER BY id ASC
-                    LIMIT 1
-                ");
+                $preparedHours[$weekday] = [
+                    'mode' => 'custom',
+                    'is_active' => $isActive,
+                    'start_time' => $startTime,
+                    'end_time' => $endTime,
+                    'break_start' => $breakStart,
+                    'break_end' => $breakEnd,
+                ];
+            }
 
-                $existing->execute([$businessId, $weekday]);
+            $this->db->beginTransaction();
+            $this->lockScheduleScope($businessId, $scheduleProfessionalId);
+
+            foreach ($preparedHours as $weekday => $row) {
+                if ($row['mode'] === 'inherit') {
+                    $delete = $this->db->prepare("
+                        DELETE FROM business_hours
+                        WHERE business_id = ?
+                          AND professional_id = ?
+                          AND weekday = ?
+                    ");
+                    $delete->execute([$businessId, $scheduleProfessionalId, $weekday]);
+                    continue;
+                }
+
+                if ($scheduleProfessionalId === null) {
+                    $existing = $this->db->prepare("
+                        SELECT id
+                        FROM business_hours
+                        WHERE business_id = ?
+                          AND professional_id IS NULL
+                          AND weekday = ?
+                        ORDER BY id DESC
+                        LIMIT 1
+                        FOR UPDATE
+                    ");
+                    $existing->execute([$businessId, $weekday]);
+                } else {
+                    $existing = $this->db->prepare("
+                        SELECT id
+                        FROM business_hours
+                        WHERE business_id = ?
+                          AND professional_id = ?
+                          AND weekday = ?
+                        ORDER BY id DESC
+                        LIMIT 1
+                        FOR UPDATE
+                    ");
+                    $existing->execute([$businessId, $scheduleProfessionalId, $weekday]);
+                }
+
                 $businessHour = $existing->fetch();
 
                 if ($businessHour) {
+                    $scopeCondition = $scheduleProfessionalId === null
+                        ? 'AND professional_id IS NULL'
+                        : 'AND professional_id = ?';
                     $stmt = $this->db->prepare("
                         UPDATE business_hours
                         SET
@@ -886,22 +1119,30 @@
                             is_active = ?
                         WHERE id = ?
                           AND business_id = ?
+                          {$scopeCondition}
                     ");
 
-                    $stmt->execute([
-                        $startTime,
-                        $endTime,
-                        $breakStart,
-                        $breakEnd,
-                        $isActive,
+                    $params = [
+                        $row['start_time'],
+                        $row['end_time'],
+                        $row['break_start'],
+                        $row['break_end'],
+                        $row['is_active'],
                         $businessHour['id'],
-                        $businessId
-                    ]);
+                        $businessId,
+                    ];
+
+                    if ($scheduleProfessionalId !== null) {
+                        $params[] = $scheduleProfessionalId;
+                    }
+
+                    $stmt->execute($params);
                 } else {
                     $stmt = $this->db->prepare("
                         INSERT INTO business_hours
                         (
                             business_id,
+                            professional_id,
                             weekday,
                             start_time,
                             end_time,
@@ -910,34 +1151,40 @@
                             is_active
                         )
                         VALUES
-                        (?, ?, ?, ?, ?, ?, ?)
+                        (?, ?, ?, ?, ?, ?, ?, ?)
                     ");
 
                     $stmt->execute([
                         $businessId,
+                        $scheduleProfessionalId,
                         $weekday,
-                        $startTime,
-                        $endTime,
-                        $breakStart,
-                        $breakEnd,
-                        $isActive
+                        $row['start_time'],
+                        $row['end_time'],
+                        $row['break_start'],
+                        $row['break_end'],
+                        $row['is_active'],
                     ]);
                 }
             }
 
+            $this->db->commit();
             $_SESSION['flash_success'] = 'Horarios laborales actualizados correctamente.';
 
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+
             $_SESSION['flash_error'] = $e->getMessage();
         }
 
-        header('Location: ' . APP_URL . '/schedule');
+        header('Location: ' . $redirectUrl);
         exit;
     }
 
     public function storeScheduleException(): void
     {
-        Auth::requireLogin();
+        Auth::requireScheduleAccess();
         Auth::startSession();
 
         $csrfToken = $_POST['csrf_token'] ?? null;
@@ -949,6 +1196,11 @@
         }
 
         $businessId = $this->getCurrentBusinessId();
+        $scheduleProfessionalId = $this->resolveScheduleProfessionalId(
+            $businessId,
+            $_POST['professional_id'] ?? null
+        );
+        $redirectUrl = $this->getScheduleUrl($scheduleProfessionalId);
 
         $date = trim($_POST['date'] ?? '');
         $type = trim($_POST['type'] ?? '');
@@ -959,6 +1211,17 @@
         try {
             if ($date === '') {
                 throw new Exception('Seleccioná una fecha.');
+            }
+
+            $dateObject = DateTime::createFromFormat('!Y-m-d', $date);
+            $dateErrors = DateTime::getLastErrors();
+
+            if (
+                !$dateObject
+                || ($dateErrors !== false && ($dateErrors['warning_count'] > 0 || $dateErrors['error_count'] > 0))
+                || $dateObject->format('Y-m-d') !== $date
+            ) {
+                throw new RuntimeException('La fecha seleccionada no es válida.');
             }
 
             if (!in_array($type, ['blocked_day', 'blocked_range', 'extra_hours'], true)) {
@@ -980,10 +1243,14 @@
                 }
             }
 
+            $this->db->beginTransaction();
+            $this->lockScheduleScope($businessId, $scheduleProfessionalId);
+
             $stmt = $this->db->prepare("
                 INSERT INTO schedule_exceptions
                 (
                     business_id,
+                    professional_id,
                     date,
                     start_time,
                     end_time,
@@ -991,11 +1258,12 @@
                     reason
                 )
                 VALUES
-                (?, ?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?, ?)
             ");
 
             $stmt->execute([
                 $businessId,
+                $scheduleProfessionalId,
                 $date,
                 $startTime,
                 $endTime,
@@ -1003,19 +1271,24 @@
                 $reason !== '' ? $reason : null
             ]);
 
+            $this->db->commit();
             $_SESSION['flash_success'] = 'Bloqueo o excepción creada correctamente.';
 
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+
             $_SESSION['flash_error'] = $e->getMessage();
         }
 
-        header('Location: ' . APP_URL . '/schedule');
+        header('Location: ' . $redirectUrl);
         exit;
     }
 
     public function deleteScheduleException(): void
     {
-        Auth::requireLogin();
+        Auth::requireScheduleAccess();
         Auth::startSession();
 
         $csrfToken = $_POST['csrf_token'] ?? null;
@@ -1027,28 +1300,82 @@
         }
 
         $businessId = $this->getCurrentBusinessId();
+        $scheduleProfessionalId = $this->resolveScheduleProfessionalId(
+            $businessId,
+            $_POST['professional_id'] ?? null
+        );
+        $redirectUrl = $this->getScheduleUrl($scheduleProfessionalId);
         $exceptionId = (int) ($_POST['exception_id'] ?? 0);
 
         if ($exceptionId <= 0) {
             $_SESSION['flash_error'] = 'ID de bloqueo inválido.';
-            header('Location: ' . APP_URL . '/schedule');
+            header('Location: ' . $redirectUrl);
             exit;
         }
 
-        $stmt = $this->db->prepare("
-            DELETE FROM schedule_exceptions
-            WHERE id = ?
-              AND business_id = ?
-        ");
+        try {
+            $this->db->beginTransaction();
+            $this->lockScheduleScope($businessId, $scheduleProfessionalId);
 
-        $stmt->execute([
-            $exceptionId,
-            $businessId
-        ]);
+            if ($scheduleProfessionalId === null) {
+                $existing = $this->db->prepare("
+                    SELECT id
+                    FROM schedule_exceptions
+                    WHERE id = ?
+                      AND business_id = ?
+                      AND professional_id IS NULL
+                    FOR UPDATE
+                ");
+                $existing->execute([$exceptionId, $businessId]);
+            } else {
+                $existing = $this->db->prepare("
+                    SELECT id
+                    FROM schedule_exceptions
+                    WHERE id = ?
+                      AND business_id = ?
+                      AND professional_id = ?
+                    FOR UPDATE
+                ");
+                $existing->execute([$exceptionId, $businessId, $scheduleProfessionalId]);
+            }
 
-        $_SESSION['flash_success'] = 'Bloqueo eliminado correctamente.';
+            if (!$existing->fetch()) {
+                throw new RuntimeException('El bloqueo no existe o no pertenece al alcance seleccionado.');
+            }
 
-        header('Location: ' . APP_URL . '/schedule');
+            $scopeCondition = $scheduleProfessionalId === null
+                ? 'AND professional_id IS NULL'
+                : 'AND professional_id = ?';
+            $stmt = $this->db->prepare("
+                DELETE FROM schedule_exceptions
+                WHERE id = ?
+                  AND business_id = ?
+                  {$scopeCondition}
+            ");
+
+            $params = [$exceptionId, $businessId];
+
+            if ($scheduleProfessionalId !== null) {
+                $params[] = $scheduleProfessionalId;
+            }
+
+            $stmt->execute($params);
+
+            if ($stmt->rowCount() !== 1) {
+                throw new RuntimeException('No se pudo eliminar el bloqueo seleccionado.');
+            }
+
+            $this->db->commit();
+            $_SESSION['flash_success'] = 'Bloqueo eliminado correctamente.';
+        } catch (Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+
+            $_SESSION['flash_error'] = $e->getMessage();
+        }
+
+        header('Location: ' . $redirectUrl);
         exit;
     }
 
@@ -1075,7 +1402,7 @@
         $this->renderAppointmentsList(
             'pending_approval',
             'Pendientes de aprobación',
-            'Turnos que necesitan ser aprobados por Meli.'
+            'Turnos que todavía requieren aprobación interna.'
         );
     }
 
@@ -1088,20 +1415,21 @@
         );
     }
 
-    public function confirmAppointment(): void
+    public function approveAppointment(): void
     {
         Auth::requireLogin();
         Auth::startSession();
 
         $csrfToken = $_POST['csrf_token'] ?? null;
 
-        if (!Auth::validateCsrfToken($csrfToken)) {
+        if (!is_string($csrfToken) || !Auth::validateCsrfToken($csrfToken)) {
             $_SESSION['flash_error'] = 'La sesión del formulario venció. Volvé a intentarlo.';
             header('Location: ' . APP_URL . '/appointments/pending-approval');
             exit;
         }
 
         $businessId = $this->getCurrentBusinessId();
+        $professionalId = $this->getCurrentProfessionalId();
         $appointmentId = (int) ($_POST['appointment_id'] ?? 0);
 
         if ($appointmentId <= 0) {
@@ -1110,27 +1438,74 @@
             exit;
         }
 
-        $stmt = $this->db->prepare("
-            UPDATE appointments
-            SET status = 'confirmed'
-            WHERE id = ?
-            AND business_id = ?
-            AND status = 'pending_approval'
-        ");
+        try {
+            $this->db->beginTransaction();
 
-        $stmt->execute([
-            $appointmentId,
-            $businessId
-        ]);
+            $lockSql = "
+                SELECT status
+                FROM appointments
+                WHERE id = ?
+                  AND business_id = ?
+            ";
+            $lockParams = [$appointmentId, $businessId];
 
-        if ($stmt->rowCount() > 0) {
-            $_SESSION['flash_success'] = 'Turno confirmado correctamente. Recordá enviar los mensajes de confirmación por WhatsApp.';
-        } else {
-            $_SESSION['flash_error'] = 'No se pudo confirmar el turno.';
+            if ($professionalId !== null) {
+                $lockSql .= " AND professional_id = ?";
+                $lockParams[] = $professionalId;
+            }
+
+            $lockSql .= " FOR UPDATE";
+
+            $lock = $this->db->prepare($lockSql);
+            $lock->execute($lockParams);
+            $current = $lock->fetch();
+
+            if (!$current || $current['status'] !== 'pending_approval') {
+                throw new RuntimeException('El turno ya no está pendiente de aprobación.');
+            }
+
+            $updateSql = "
+                UPDATE appointments
+                SET status = 'approved'
+                WHERE id = ?
+                  AND business_id = ?
+                  AND status = 'pending_approval'
+            ";
+            $updateParams = [$appointmentId, $businessId];
+
+            if ($professionalId !== null) {
+                $updateSql .= " AND professional_id = ?";
+                $updateParams[] = $professionalId;
+            }
+
+            $stmt = $this->db->prepare($updateSql);
+            $stmt->execute($updateParams);
+
+            if ($stmt->rowCount() !== 1) {
+                throw new RuntimeException('El estado del turno cambió durante la aprobación.');
+            }
+
+            $this->db->commit();
+            $_SESSION['flash_success'] = 'Turno aprobado. Ya podés preparar la confirmación por WhatsApp.';
+        } catch (Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+
+            $_SESSION['flash_error'] = 'No se pudo aprobar el turno.';
         }
 
         header('Location: ' . APP_URL . '/appointments/pending-approval');
         exit;
+    }
+
+    public function appointmentsApproved(): void
+    {
+        $this->renderAppointmentsList(
+            'approved',
+            'Pendientes de confirmación',
+            'Turnos aprobados que esperan confirmación por WhatsApp.'
+        );
     }
 
     public function appointmentsConfirmed(): void
@@ -1138,7 +1513,7 @@
         $this->renderAppointmentsList(
             'confirmed',
             'Turnos confirmados',
-            'Todos los turnos confirmados.'
+            'Turnos cuyo envío por WhatsApp se registró manualmente.'
         );
     }
 
@@ -1167,7 +1542,11 @@
 
         $businessId = $this->getCurrentBusinessId();
         $business = $this->getBusiness($businessId);
-        $appointments = $this->getAppointmentsList($businessId, $type);
+        $appointments = $this->getAppointmentsList(
+            $businessId,
+            $type,
+            $this->getCurrentProfessionalId()
+        );
 
         $error = $_SESSION['flash_error'] ?? null;
         $success = $_SESSION['flash_success'] ?? null;
@@ -1179,22 +1558,32 @@
 
     private function getCurrentBusinessId(): int
     {
-        $user = Auth::user();
+        $businessId = Auth::businessId();
 
-        if (!$user) {
-            header('Location: ' . APP_URL . '/login');
+        if ($businessId === null) {
+            http_response_code(403);
+            echo 'Acceso no permitido.';
             exit;
         }
 
-        /*
-         * Si sos super_admin, por ahora usamos Meli como negocio principal.
-         * Más adelante vamos a crear selector de negocios.
-         */
-        if ($user['role'] === 'super_admin') {
-            return 1;
+        return $businessId;
+    }
+
+    private function getCurrentProfessionalId(): ?int
+    {
+        if (!Auth::isProfessional()) {
+            return null;
         }
 
-        return (int) $user['business_id'];
+        $professionalId = Auth::professionalId();
+
+        if ($professionalId === null) {
+            http_response_code(403);
+            echo 'Acceso no permitido.';
+            exit;
+        }
+
+        return $professionalId;
     }
 
     private function getBusiness(int $businessId): array
@@ -1216,7 +1605,7 @@
         return $business;
     }
 
-    private function getDashboardStats(int $businessId): array
+    private function getDashboardStats(int $businessId, ?int $professionalId = null): array
     {
         $todayStart = date('Y-m-d 00:00:00');
         $todayEnd = date('Y-m-d 23:59:59');
@@ -1225,46 +1614,77 @@
         $weekEnd = date('Y-m-d 23:59:59', strtotime('sunday this week'));
 
         return [
-            'today' => $this->countAppointments($businessId, $todayStart, $todayEnd),
-            'week' => $this->countAppointments($businessId, $weekStart, $weekEnd),
-            'pending_approval' => $this->countByStatus($businessId, 'pending_approval'),
-            'pending_deposit' => $this->countPendingDeposit($businessId),
+            'today' => $this->countAppointments($businessId, $todayStart, $todayEnd, $professionalId),
+            'week' => $this->countAppointments($businessId, $weekStart, $weekEnd, $professionalId),
+            'pending_approval' => $this->countByStatus($businessId, 'pending_approval', $professionalId),
+            'pending_deposit' => $this->countPendingDeposit($businessId, $professionalId),
+            'approved' => $this->countByStatus($businessId, 'approved', $professionalId),
+            'confirmed' => $this->countByStatus($businessId, 'confirmed', $professionalId),
         ];
     }
 
-    private function countAppointments(int $businessId, string $start, string $end): int
+    private function countAppointments(
+        int $businessId,
+        string $start,
+        string $end,
+        ?int $professionalId = null
+    ): int
     {
+        $professionalScope = $professionalId !== null ? ' AND professional_id = ?' : '';
+
         $stmt = $this->db->prepare("
             SELECT COUNT(*) AS total
             FROM appointments
             WHERE business_id = ?
               AND start_at BETWEEN ? AND ?
               AND status NOT IN ('cancelled')
+              {$professionalScope}
         ");
 
-        $stmt->execute([$businessId, $start, $end]);
+        $params = [$businessId, $start, $end];
+
+        if ($professionalId !== null) {
+            $params[] = $professionalId;
+        }
+
+        $stmt->execute($params);
         $row = $stmt->fetch();
 
         return (int) $row['total'];
     }
 
-    private function countByStatus(int $businessId, string $status): int
+    private function countByStatus(
+        int $businessId,
+        string $status,
+        ?int $professionalId = null
+    ): int
     {
+        $professionalScope = $professionalId !== null ? ' AND professional_id = ?' : '';
+
         $stmt = $this->db->prepare("
             SELECT COUNT(*) AS total
             FROM appointments
             WHERE business_id = ?
               AND status = ?
+              {$professionalScope}
         ");
 
-        $stmt->execute([$businessId, $status]);
+        $params = [$businessId, $status];
+
+        if ($professionalId !== null) {
+            $params[] = $professionalId;
+        }
+
+        $stmt->execute($params);
         $row = $stmt->fetch();
 
         return (int) $row['total'];
     }
 
-    private function countPendingDeposit(int $businessId): int
+    private function countPendingDeposit(int $businessId, ?int $professionalId = null): int
     {
+        $professionalScope = $professionalId !== null ? ' AND professional_id = ?' : '';
+
         $stmt = $this->db->prepare("
             SELECT COUNT(*) AS total
             FROM appointments
@@ -1274,19 +1694,28 @@
                 status = 'pending_deposit'
                 OR deposit_status = 'pending'
               )
+              {$professionalScope}
         ");
 
-        $stmt->execute([$businessId]);
+        $params = [$businessId];
+
+        if ($professionalId !== null) {
+            $params[] = $professionalId;
+        }
+
+        $stmt->execute($params);
         $row = $stmt->fetch();
 
         return (int) $row['total'];
     }
 
-    private function getTodayAppointments(int $businessId): array
+    private function getTodayAppointments(int $businessId, ?int $professionalId = null): array
     {
         $todayStart = date('Y-m-d 00:00:00');
         $todayEnd = date('Y-m-d 23:59:59');
 
+        $professionalScope = $professionalId !== null ? ' AND a.professional_id = ?' : '';
+
         $stmt = $this->db->prepare("
             SELECT
                 a.id,
@@ -1299,22 +1728,31 @@
                 c.phone AS customer_phone,
                 s.name AS service_name
             FROM appointments a
-            INNER JOIN customers c ON c.id = a.customer_id
+            INNER JOIN customers c ON c.id = a.customer_id AND c.business_id = a.business_id
             INNER JOIN services s ON s.id = a.service_id
             WHERE a.business_id = ?
               AND a.start_at BETWEEN ? AND ?
               AND a.status NOT IN ('cancelled')
+              {$professionalScope}
             ORDER BY a.start_at ASC
         ");
 
-        $stmt->execute([$businessId, $todayStart, $todayEnd]);
+        $params = [$businessId, $todayStart, $todayEnd];
+
+        if ($professionalId !== null) {
+            $params[] = $professionalId;
+        }
+
+        $stmt->execute($params);
 
         return $stmt->fetchAll();
     }
 
-    private function getUpcomingAppointments(int $businessId): array
+    private function getUpcomingAppointments(int $businessId, ?int $professionalId = null): array
     {
         $now = date('Y-m-d H:i:s');
+
+        $professionalScope = $professionalId !== null ? ' AND a.professional_id = ?' : '';
 
         $stmt = $this->db->prepare("
             SELECT
@@ -1328,21 +1766,41 @@
                 c.phone AS customer_phone,
                 s.name AS service_name
             FROM appointments a
-            INNER JOIN customers c ON c.id = a.customer_id
+            INNER JOIN customers c ON c.id = a.customer_id AND c.business_id = a.business_id
             INNER JOIN services s ON s.id = a.service_id
             WHERE a.business_id = ?
               AND a.start_at >= ?
               AND a.status NOT IN ('cancelled', 'completed')
+              {$professionalScope}
             ORDER BY a.start_at ASC
             LIMIT 8
         ");
 
-        $stmt->execute([$businessId, $now]);
+        $params = [$businessId, $now];
+
+        if ($professionalId !== null) {
+            $params[] = $professionalId;
+        }
+
+        $stmt->execute($params);
 
         return $stmt->fetchAll();
     }
-    private function getActiveServices(int $businessId): array
+    private function getActiveServices(int $businessId, ?int $professionalId = null): array
     {
+        $professionalScope = $professionalId !== null
+            ? "
+              AND EXISTS (
+                  SELECT 1
+                  FROM service_professionals sp
+                  WHERE sp.business_id = s.business_id
+                    AND sp.service_id = s.id
+                    AND sp.professional_id = ?
+                    AND sp.is_active = 1
+              )
+            "
+            : '';
+
         $stmt = $this->db->prepare("
             SELECT
                 s.id,
@@ -1359,10 +1817,17 @@
             LEFT JOIN service_categories c ON c.id = s.category_id
             WHERE s.business_id = ?
               AND s.is_active = 1
+              {$professionalScope}
             ORDER BY c.sort_order ASC, s.sort_order ASC, s.name ASC
         ");
 
-        $stmt->execute([$businessId]);
+        $params = [$businessId];
+
+        if ($professionalId !== null) {
+            $params[] = $professionalId;
+        }
+
+        $stmt->execute($params);
 
         return $stmt->fetchAll();
     }
@@ -1407,7 +1872,12 @@
         return (int) $row['total'] > 0;
     }
 
-    private function findOrCreateCustomer(int $businessId, string $name, string $phone): int
+    private function findOrCreateCustomer(
+        int $businessId,
+        string $name,
+        string $phone,
+        bool $updateExisting = true
+    ): int
     {
         $stmt = $this->db->prepare("
             SELECT id
@@ -1424,18 +1894,22 @@
 
         $customer = $stmt->fetch();
 
-        if ($customer) {
+        if ($customer && $updateExisting) {
             $update = $this->db->prepare("
                 UPDATE customers
                 SET name = ?, updated_at = NOW()
                 WHERE id = ?
+                  AND business_id = ?
             ");
 
             $update->execute([
                 $name,
-                $customer['id']
+                $customer['id'],
+                $businessId
             ]);
+        }
 
+        if ($customer) {
             return (int) $customer['id'];
         }
 
@@ -1462,8 +1936,128 @@
         header('Location: ' . APP_URL . '/appointments/create');
         exit;
     }
-    private function getAppointment(int $businessId, int $appointmentId): ?array
+
+    private function redirectAppointmentCreateWithError(string $resultId, string $message): void
     {
+        $this->storeAppointmentCreateResult($resultId, [
+            'error' => $message,
+            'old' => $this->getAppointmentCreateOldInput(),
+        ]);
+
+        header('Location: ' . APP_URL . '/appointments/create?result=' . rawurlencode($resultId));
+        exit;
+    }
+
+    private function storeAppointmentCreateResult(string $resultId, array $result): void
+    {
+        $this->pruneAppointmentCreateResults();
+
+        $results = $_SESSION['appointment_create_results'] ?? [];
+        $result['created_at'] = time();
+        $results[$resultId] = $result;
+
+        uasort($results, static function (array $left, array $right): int {
+            return (int) ($left['created_at'] ?? 0) <=> (int) ($right['created_at'] ?? 0);
+        });
+
+        while (count($results) > 20) {
+            $oldestResultId = array_key_first($results);
+
+            if ($oldestResultId === null) {
+                break;
+            }
+
+            unset($results[$oldestResultId]);
+        }
+
+        $_SESSION['appointment_create_results'] = $results;
+    }
+
+    private function consumeAppointmentCreateResult($resultId): array
+    {
+        if (!is_string($resultId) || preg_match('/\A[a-f0-9]{32}\z/', $resultId) !== 1) {
+            return [];
+        }
+
+        $this->pruneAppointmentCreateResults();
+        $results = $_SESSION['appointment_create_results'] ?? [];
+        $result = $results[$resultId] ?? [];
+
+        unset($results[$resultId]);
+
+        if (empty($results)) {
+            unset($_SESSION['appointment_create_results']);
+        } else {
+            $_SESSION['appointment_create_results'] = $results;
+        }
+
+        if (!is_array($result)) {
+            return [];
+        }
+
+        unset($result['created_at']);
+
+        return $result;
+    }
+
+    private function pruneAppointmentCreateResults(): void
+    {
+        $results = $_SESSION['appointment_create_results'] ?? [];
+
+        if (!is_array($results)) {
+            unset($_SESSION['appointment_create_results']);
+            return;
+        }
+
+        $expiresBefore = time() - 900;
+
+        foreach ($results as $resultId => $result) {
+            if (!is_array($result) || (int) ($result['created_at'] ?? 0) < $expiresBefore) {
+                unset($results[$resultId]);
+            }
+        }
+
+        if (empty($results)) {
+            unset($_SESSION['appointment_create_results']);
+            return;
+        }
+
+        $_SESSION['appointment_create_results'] = $results;
+    }
+
+    private function getAppointmentCreateOldInput(): array
+    {
+        $fields = [
+            'customer_name',
+            'customer_phone',
+            'service_id',
+            'professional_id',
+            'date',
+            'time',
+            'status',
+            'origin_channel',
+            'customer_notes',
+            'internal_notes',
+        ];
+        $old = [];
+
+        foreach ($fields as $field) {
+            if (isset($_POST[$field]) && is_scalar($_POST[$field])) {
+                $old[$field] = (string) $_POST[$field];
+            }
+        }
+
+        return $old;
+    }
+
+    private function getAppointment(
+        int $businessId,
+        int $appointmentId,
+        ?int $professionalId = null
+    ): ?array
+    {
+        $professionalScope = $professionalId !== null ? ' AND a.professional_id = ?' : '';
+
         $stmt = $this->db->prepare("
             SELECT
                 a.*,
@@ -1473,17 +2067,24 @@
                 s.name AS service_name,
                 s.duration_default AS service_duration
             FROM appointments a
-            INNER JOIN customers c ON c.id = a.customer_id
+            INNER JOIN customers c ON c.id = a.customer_id AND c.business_id = a.business_id
             INNER JOIN services s ON s.id = a.service_id
             WHERE a.business_id = ?
               AND a.id = ?
+              {$professionalScope}
             LIMIT 1
         ");
 
-        $stmt->execute([
+        $params = [
             $businessId,
             $appointmentId
-        ]);
+        ];
+
+        if ($professionalId !== null) {
+            $params[] = $professionalId;
+        }
+
+        $stmt->execute($params);
 
         $appointment = $stmt->fetch();
 
@@ -1719,7 +2320,164 @@
         ];
     }
 
-    private function getBusinessHoursMap(int $businessId): array
+    private function resolveScheduleProfessionalId(int $businessId, $requestedProfessionalId): ?int
+    {
+        if (Auth::isProfessional()) {
+            $professionalId = Auth::professionalId();
+
+            if (
+                !Auth::canManageOwnSchedule()
+                || $professionalId === null
+                || !$this->getScheduleProfessional($businessId, $professionalId, true)
+            ) {
+                $this->denyScheduleAccess();
+            }
+
+            return $professionalId;
+        }
+
+        if (!Auth::isAdministrator()) {
+            $this->denyScheduleAccess();
+        }
+
+        if (
+            $requestedProfessionalId === null
+            || $requestedProfessionalId === ''
+            || $requestedProfessionalId === 'general'
+        ) {
+            return null;
+        }
+
+        $rawProfessionalId = (string) $requestedProfessionalId;
+
+        if (!preg_match('/^[1-9]\d*$/', $rawProfessionalId)) {
+            $this->denyScheduleAccess();
+        }
+
+        $professionalId = (int) $rawProfessionalId;
+
+        if (!$this->getScheduleProfessional($businessId, $professionalId)) {
+            $this->denyScheduleAccess();
+        }
+
+        return $professionalId;
+    }
+
+    private function getScheduleProfessional(
+        int $businessId,
+        int $professionalId,
+        bool $requireActive = false
+    ): ?array
+    {
+        $activeCondition = $requireActive ? 'AND is_active = 1' : '';
+        $stmt = $this->db->prepare("
+            SELECT id, business_id, name, is_active, can_manage_own_schedule
+            FROM professionals
+            WHERE id = ?
+              AND business_id = ?
+              {$activeCondition}
+            LIMIT 1
+        ");
+        $stmt->execute([$professionalId, $businessId]);
+        $professional = $stmt->fetch();
+
+        return $professional ?: null;
+    }
+
+    private function getScheduleProfessionals(int $businessId): array
+    {
+        $stmt = $this->db->prepare("
+            SELECT id, name, is_active
+            FROM professionals
+            WHERE business_id = ?
+            ORDER BY is_active DESC, sort_order ASC, name ASC
+        ");
+        $stmt->execute([$businessId]);
+
+        return $stmt->fetchAll();
+    }
+
+    private function getScheduleUrl(?int $professionalId): string
+    {
+        if (!Auth::isAdministrator() || $professionalId === null) {
+            return APP_URL . '/schedule';
+        }
+
+        return APP_URL . '/schedule?professional_id=' . $professionalId;
+    }
+
+    private function lockScheduleScope(int $businessId, ?int $professionalId): void
+    {
+        if ($professionalId === null) {
+            if (!Auth::isAdministrator()) {
+                throw new RuntimeException('No tenés permiso para modificar el horario general.');
+            }
+
+            $stmt = $this->db->prepare("
+                SELECT id
+                FROM businesses
+                WHERE id = ?
+                FOR UPDATE
+            ");
+            $stmt->execute([$businessId]);
+
+            if (!$stmt->fetch()) {
+                throw new RuntimeException('No se encontró el negocio del horario.');
+            }
+
+            return;
+        }
+
+        if (Auth::isProfessional()) {
+            $user = Auth::user();
+            $authenticatedProfessionalId = Auth::professionalId();
+
+            if (
+                !$user
+                || !Auth::canManageOwnSchedule()
+                || $authenticatedProfessionalId !== $professionalId
+            ) {
+                throw new RuntimeException('No tenés permiso para modificar este horario.');
+            }
+
+            $stmt = $this->db->prepare("
+                SELECT id
+                FROM professionals
+                WHERE id = ?
+                  AND business_id = ?
+                  AND user_id = ?
+                  AND is_active = 1
+                  AND can_manage_own_schedule = 1
+                FOR UPDATE
+            ");
+            $stmt->execute([$professionalId, $businessId, (int) $user['id']]);
+        } elseif (Auth::isAdministrator()) {
+            $stmt = $this->db->prepare("
+                SELECT id
+                FROM professionals
+                WHERE id = ?
+                  AND business_id = ?
+                FOR UPDATE
+            ");
+            $stmt->execute([$professionalId, $businessId]);
+        } else {
+            throw new RuntimeException('No tenés permiso para modificar este horario.');
+        }
+
+        if (!$stmt->fetch()) {
+            throw new RuntimeException('La profesional ya no pertenece al alcance permitido.');
+        }
+    }
+
+    private function denyScheduleAccess(): void
+    {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Acceso no permitido.';
+        exit;
+    }
+
+    private function getBusinessHoursMap(int $businessId, ?int $professionalId): array
     {
         $default = [];
 
@@ -1731,46 +2489,121 @@
                 'break_start' => null,
                 'break_end' => null,
                 'is_active' => 0,
+                'schedule_mode' => $professionalId === null ? 'custom' : 'inherit',
+                'is_inherited' => $professionalId !== null,
             ];
         }
 
-        $stmt = $this->db->prepare("
-            SELECT *
-            FROM business_hours
-            WHERE business_id = ?
-            ORDER BY weekday ASC, id ASC
-        ");
+        $generalRows = $this->getBusinessHoursRows($businessId, null);
 
-        $stmt->execute([$businessId]);
-        $rows = $stmt->fetchAll();
+        if ($professionalId === null) {
+            foreach ($generalRows as $weekday => $row) {
+                $default[$weekday] = array_merge($row, [
+                    'schedule_mode' => 'custom',
+                    'is_inherited' => false,
+                ]);
+            }
 
-        foreach ($rows as $row) {
-            $weekday = (int) $row['weekday'];
+            return $default;
+        }
 
-            if (!isset($default[$weekday])) {
+        $ownRows = $this->getBusinessHoursRows($businessId, $professionalId);
+
+        foreach (range(0, 6) as $weekday) {
+            if (isset($ownRows[$weekday])) {
+                $default[$weekday] = array_merge($ownRows[$weekday], [
+                    'schedule_mode' => 'custom',
+                    'is_inherited' => false,
+                ]);
                 continue;
             }
 
-            $default[$weekday] = $row;
+            if (isset($generalRows[$weekday])) {
+                $default[$weekday] = array_merge($generalRows[$weekday], [
+                    'schedule_mode' => 'inherit',
+                    'is_inherited' => true,
+                ]);
+            }
         }
 
         return $default;
     }
 
-    private function getScheduleExceptions(int $businessId): array
+    private function getBusinessHoursRows(int $businessId, ?int $professionalId): array
     {
-        $stmt = $this->db->prepare("
-            SELECT *
-            FROM schedule_exceptions
-            WHERE business_id = ?
-              AND date >= CURDATE()
-            ORDER BY date ASC, start_time ASC, id ASC
-            LIMIT 100
-        ");
+        if ($professionalId === null) {
+            $stmt = $this->db->prepare("
+                SELECT *
+                FROM business_hours
+                WHERE business_id = ?
+                  AND professional_id IS NULL
+                ORDER BY weekday ASC, id ASC
+            ");
+            $stmt->execute([$businessId]);
+        } else {
+            $stmt = $this->db->prepare("
+                SELECT *
+                FROM business_hours
+                WHERE business_id = ?
+                  AND professional_id = ?
+                ORDER BY weekday ASC, id ASC
+            ");
+            $stmt->execute([$businessId, $professionalId]);
+        }
 
-        $stmt->execute([$businessId]);
+        $rowsByWeekday = [];
 
-        return $stmt->fetchAll();
+        foreach ($stmt->fetchAll() as $row) {
+            $weekday = (int) $row['weekday'];
+
+            if ($weekday >= 0 && $weekday <= 6) {
+                $rowsByWeekday[$weekday] = $row;
+            }
+        }
+
+        return $rowsByWeekday;
+    }
+
+    private function getScheduleExceptions(int $businessId, ?int $professionalId): array
+    {
+        if ($professionalId === null) {
+            $stmt = $this->db->prepare("
+                SELECT *
+                FROM schedule_exceptions
+                WHERE business_id = ?
+                  AND professional_id IS NULL
+                  AND date >= CURDATE()
+                ORDER BY date ASC, start_time ASC, id ASC
+                LIMIT 100
+            ");
+            $stmt->execute([$businessId]);
+        } else {
+            $stmt = $this->db->prepare("
+                SELECT *
+                FROM schedule_exceptions
+                WHERE business_id = ?
+                  AND (professional_id IS NULL OR professional_id = ?)
+                  AND date >= CURDATE()
+                ORDER BY date ASC, start_time ASC, id ASC
+                LIMIT 100
+            ");
+            $stmt->execute([$businessId, $professionalId]);
+        }
+
+        $exceptions = $stmt->fetchAll();
+
+        foreach ($exceptions as &$exception) {
+            $exceptionProfessionalId = isset($exception['professional_id'])
+                ? (int) $exception['professional_id']
+                : null;
+            $exception['is_general'] = $exceptionProfessionalId === null;
+            $exception['can_delete'] = $professionalId === null
+                ? $exceptionProfessionalId === null
+                : $exceptionProfessionalId === $professionalId;
+        }
+        unset($exception);
+
+        return $exceptions;
     }
 
     private function normalizeTime(?string $time): ?string
@@ -1802,7 +2635,11 @@
         return strtotime($timeA) <= strtotime($timeB);
     }
 
-    private function getAppointmentsList(int $businessId, string $type): array
+    private function getAppointmentsList(
+        int $businessId,
+        string $type,
+        ?int $professionalId = null
+    ): array
 {
     $where = "";
     $params = [$businessId];
@@ -1830,13 +2667,23 @@
 
     if ($type === 'pending_deposit') {
         $where = "
-            AND a.status = 'pending_deposit'
+            AND a.status NOT IN ('cancelled', 'completed')
+            AND (
+                a.status = 'pending_deposit'
+                OR a.deposit_status = 'pending'
+            )
         ";
     }
 
     if ($type === 'confirmed') {
         $where = "
             AND a.status = 'confirmed'
+        ";
+    }
+
+    if ($type === 'approved') {
+        $where = "
+            AND a.status = 'approved'
         ";
     }
 
@@ -1850,6 +2697,11 @@
         $where = "
             AND a.status = 'consultation'
         ";
+    }
+
+    if ($professionalId !== null) {
+        $where .= " AND a.professional_id = ?";
+        $params[] = $professionalId;
     }
 
     $stmt = $this->db->prepare("
@@ -1870,7 +2722,7 @@
             s.duration_default,
             p.name AS professional_name
         FROM appointments a
-        INNER JOIN customers c ON c.id = a.customer_id
+        INNER JOIN customers c ON c.id = a.customer_id AND c.business_id = a.business_id
         INNER JOIN services s ON s.id = a.service_id
         LEFT JOIN professionals p ON p.id = a.professional_id
         WHERE a.business_id = ?
@@ -1883,8 +2735,10 @@
     return $stmt->fetchAll();
 }
 
-private function getActiveProfessionals(int $businessId): array
+private function getActiveProfessionals(int $businessId, ?int $professionalId = null): array
 {
+    $professionalScope = $professionalId !== null ? ' AND id = ?' : '';
+
     $stmt = $this->db->prepare("
         SELECT
             id,
@@ -1897,16 +2751,29 @@ private function getActiveProfessionals(int $businessId): array
         FROM professionals
         WHERE business_id = ?
           AND is_active = 1
+          {$professionalScope}
         ORDER BY sort_order ASC, name ASC
     ");
 
-    $stmt->execute([$businessId]);
+    $params = [$businessId];
+
+    if ($professionalId !== null) {
+        $params[] = $professionalId;
+    }
+
+    $stmt->execute($params);
 
     return $stmt->fetchAll();
 }
 
-private function getProfessionalsForService(int $businessId, int $serviceId): array
+private function getProfessionalsForService(
+    int $businessId,
+    int $serviceId,
+    ?int $professionalId = null
+): array
 {
+    $professionalScope = $professionalId !== null ? ' AND p.id = ?' : '';
+
     $stmt = $this->db->prepare("
         SELECT
             p.id,
@@ -1924,13 +2791,20 @@ private function getProfessionalsForService(int $businessId, int $serviceId): ar
         WHERE p.business_id = ?
           AND sp.service_id = ?
           AND p.is_active = 1
+          {$professionalScope}
         ORDER BY p.sort_order ASC, p.name ASC
     ");
 
-    $stmt->execute([
+    $params = [
         $businessId,
         $serviceId
-    ]);
+    ];
+
+    if ($professionalId !== null) {
+        $params[] = $professionalId;
+    }
+
+    $stmt->execute($params);
 
     return $stmt->fetchAll();
 }
@@ -1960,11 +2834,19 @@ private function professionalCanDoService(int $businessId, int $professionalId, 
 
     $stmt = $this->db->prepare("
         SELECT COUNT(*) AS total
-        FROM service_professionals
-        WHERE business_id = ?
-          AND professional_id = ?
-          AND service_id = ?
-          AND is_active = 1
+        FROM service_professionals sp
+        INNER JOIN professionals p
+            ON p.id = sp.professional_id
+            AND p.business_id = sp.business_id
+            AND p.is_active = 1
+        INNER JOIN services s
+            ON s.id = sp.service_id
+            AND s.business_id = sp.business_id
+            AND s.is_active = 1
+        WHERE sp.business_id = ?
+          AND sp.professional_id = ?
+          AND sp.service_id = ?
+          AND sp.is_active = 1
     ");
 
     $stmt->execute([
@@ -1980,13 +2862,18 @@ private function professionalCanDoService(int $businessId, int $professionalId, 
 
 public function professionals(): void
 {
-    Auth::requireLogin();
+    Auth::requireAdministrativeAccess();
 
     $businessId = $this->getBusinessId();
 
     $stmt = $this->db->prepare("
         SELECT
             p.*,
+            u.id AS access_user_id,
+            u.email AS access_email,
+            u.role AS access_role,
+            u.status AS access_status,
+            u.last_login_at AS access_last_login_at,
 
             (
                 SELECT COUNT(*)
@@ -2006,6 +2893,9 @@ public function professionals(): void
             ) AS upcoming_appointments
 
         FROM professionals p
+        LEFT JOIN users u
+            ON u.id = p.user_id
+            AND u.business_id = p.business_id
         WHERE p.business_id = ?
         ORDER BY p.is_active DESC, p.sort_order ASC, p.name ASC
     ");
@@ -2018,7 +2908,7 @@ public function professionals(): void
 
 public function createProfessional(): void
 {
-    Auth::requireLogin();
+    Auth::requireAdministrativeAccess();
 
     $businessId = $this->getBusinessId();
 
@@ -2042,7 +2932,7 @@ public function createProfessional(): void
 
 public function storeProfessional(): void
 {
-    Auth::requireLogin();
+    Auth::requireAdministrativeAccess();
     Auth::startSession();
 
     $csrfToken = $_POST['csrf_token'] ?? null;
@@ -2121,7 +3011,8 @@ if (!empty($conflicts)) {
 
 public function editProfessional(): void
 {
-    Auth::requireLogin();
+    Auth::requireAdministrativeAccess();
+    Auth::startSession();
 
     $businessId = $this->getBusinessId();
     $professionalId = (int) ($_GET['id'] ?? 0);
@@ -2138,13 +3029,17 @@ public function editProfessional(): void
 
     $assignedServiceIds = $this->getAssignedServiceIds($businessId, $professionalId);
     $services = $this->getAllServicesForProfessionalForm($businessId);
+    $error = $_SESSION['flash_error'] ?? null;
+    $success = $_SESSION['flash_success'] ?? null;
+
+    unset($_SESSION['flash_error'], $_SESSION['flash_success']);
 
     require __DIR__ . '/../views/admin/professional_edit.php';
 }
 
 public function updateProfessional(): void
 {
-    Auth::requireLogin();
+    Auth::requireAdministrativeAccess();
     Auth::startSession();
 
     $csrfToken = $_POST['csrf_token'] ?? null;
@@ -2230,6 +3125,368 @@ public function updateProfessional(): void
     }
 }
 
+public function createProfessionalAccess(): void
+{
+    Auth::requireAdministrativeAccess();
+    Auth::startSession();
+
+    $professionalId = (int) ($_POST['professional_id'] ?? 0);
+    $csrfToken = $_POST['csrf_token'] ?? null;
+
+    if (!is_string($csrfToken) || !Auth::validateCsrfToken($csrfToken)) {
+        $this->redirectProfessionalAccess($professionalId, 'La sesión del formulario venció. Volvé a intentarlo.');
+    }
+
+    $businessId = $this->getBusinessId();
+    $emailInput = $_POST['access_email'] ?? '';
+    $passwordInput = $_POST['access_password'] ?? '';
+    $passwordConfirmationInput = $_POST['access_password_confirmation'] ?? '';
+    $email = is_string($emailInput) ? strtolower(trim($emailInput)) : '';
+    $password = is_string($passwordInput) ? $passwordInput : '';
+    $passwordConfirmation = is_string($passwordConfirmationInput) ? $passwordConfirmationInput : '';
+    $passwordHash = null;
+
+    try {
+        if ($professionalId <= 0) {
+            throw new RuntimeException('Profesional inválido.');
+        }
+
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            throw new RuntimeException('Ingresá un email de acceso válido.');
+        }
+
+        $this->validateProfessionalAccessPassword($password, $passwordConfirmation);
+        $passwordHash = password_hash($password, PASSWORD_DEFAULT);
+
+        if ($passwordHash === false) {
+            throw new RuntimeException('No se pudo preparar la contraseña.');
+        }
+
+        $this->db->beginTransaction();
+
+        $professionalQuery = $this->db->prepare("
+            SELECT id, business_id, name, is_active, user_id
+            FROM professionals
+            WHERE id = ?
+              AND business_id = ?
+            LIMIT 1
+            FOR UPDATE
+        ");
+        $professionalQuery->execute([$professionalId, $businessId]);
+        $professional = $professionalQuery->fetch();
+
+        if (!$professional) {
+            throw new RuntimeException('El profesional no existe.');
+        }
+
+        if ((int) $professional['is_active'] !== 1) {
+            throw new RuntimeException('Activá primero al profesional para crearle un acceso.');
+        }
+
+        if ($professional['user_id'] !== null) {
+            throw new RuntimeException('El profesional ya tiene una cuenta vinculada.');
+        }
+
+        $emailQuery = $this->db->prepare("
+            SELECT id
+            FROM users
+            WHERE email = ?
+            LIMIT 1
+            FOR UPDATE
+        ");
+        $emailQuery->execute([$email]);
+
+        if ($emailQuery->fetch()) {
+            throw new RuntimeException('Ese email ya pertenece a otra cuenta.');
+        }
+
+        $insertUser = $this->db->prepare("
+            INSERT INTO users
+            (
+                business_id,
+                name,
+                email,
+                password_hash,
+                role,
+                status,
+                auth_version
+            )
+            VALUES
+            (?, ?, ?, ?, 'professional', 'active', 0)
+        ");
+        $insertUser->execute([
+            $businessId,
+            (string) $professional['name'],
+            $email,
+            $passwordHash,
+        ]);
+
+        $userId = (int) $this->db->lastInsertId();
+
+        if ($userId <= 0) {
+            throw new RuntimeException('No se pudo crear la cuenta de acceso.');
+        }
+
+        $linkProfessional = $this->db->prepare("
+            UPDATE professionals
+            SET user_id = ?
+            WHERE id = ?
+              AND business_id = ?
+              AND user_id IS NULL
+        ");
+        $linkProfessional->execute([$userId, $professionalId, $businessId]);
+
+        if ($linkProfessional->rowCount() !== 1) {
+            throw new RuntimeException('El vínculo del profesional cambió durante la operación.');
+        }
+
+        $this->db->commit();
+        $this->redirectProfessionalAccess($professionalId, 'Acceso profesional creado correctamente.', true);
+    } catch (RuntimeException $e) {
+        if ($this->db->inTransaction()) {
+            $this->db->rollBack();
+        }
+
+        $this->redirectProfessionalAccess($professionalId, $e->getMessage());
+    } catch (Throwable $e) {
+        if ($this->db->inTransaction()) {
+            $this->db->rollBack();
+        }
+
+        $this->redirectProfessionalAccess($professionalId, 'No se pudo crear el acceso profesional.');
+    } finally {
+        $password = '';
+        $passwordConfirmation = '';
+        $passwordHash = null;
+    }
+}
+
+public function updateProfessionalAccessStatus(): void
+{
+    Auth::requireAdministrativeAccess();
+    Auth::startSession();
+
+    $professionalId = (int) ($_POST['professional_id'] ?? 0);
+    $csrfToken = $_POST['csrf_token'] ?? null;
+
+    if (!is_string($csrfToken) || !Auth::validateCsrfToken($csrfToken)) {
+        $this->redirectProfessionalAccess($professionalId, 'La sesión del formulario venció. Volvé a intentarlo.');
+    }
+
+    $status = (string) ($_POST['access_status'] ?? '');
+
+    if (!in_array($status, ['active', 'inactive'], true)) {
+        $this->redirectProfessionalAccess($professionalId, 'El estado de acceso no es válido.');
+    }
+
+    $businessId = $this->getBusinessId();
+
+    try {
+        $this->db->beginTransaction();
+        $access = $this->lockProfessionalAccess($businessId, $professionalId);
+
+        if ($status === 'active' && (int) $access['professional']['is_active'] !== 1) {
+            throw new RuntimeException('Activá primero al profesional para habilitar su acceso.');
+        }
+
+        $update = $this->db->prepare("
+            UPDATE users
+            SET
+                status = ?,
+                auth_version = auth_version + 1
+            WHERE id = ?
+              AND business_id = ?
+              AND role = 'professional'
+        ");
+        $update->execute([
+            $status,
+            (int) $access['user']['id'],
+            $businessId,
+        ]);
+
+        if ($update->rowCount() !== 1) {
+            throw new RuntimeException('No se pudo actualizar el estado del acceso.');
+        }
+
+        (new RememberToken($this->db))->revokeAllForUser((int) $access['user']['id']);
+        $this->db->commit();
+        $message = $status === 'active'
+            ? 'Acceso profesional activado.'
+            : 'Acceso profesional desactivado.';
+        $this->redirectProfessionalAccess($professionalId, $message, true);
+    } catch (RuntimeException $e) {
+        if ($this->db->inTransaction()) {
+            $this->db->rollBack();
+        }
+
+        $this->redirectProfessionalAccess($professionalId, $e->getMessage());
+    } catch (Throwable $e) {
+        if ($this->db->inTransaction()) {
+            $this->db->rollBack();
+        }
+
+        $this->redirectProfessionalAccess($professionalId, 'No se pudo actualizar el acceso profesional.');
+    }
+}
+
+public function updateProfessionalAccessPassword(): void
+{
+    Auth::requireAdministrativeAccess();
+    Auth::startSession();
+
+    $professionalId = (int) ($_POST['professional_id'] ?? 0);
+    $csrfToken = $_POST['csrf_token'] ?? null;
+
+    if (!is_string($csrfToken) || !Auth::validateCsrfToken($csrfToken)) {
+        $this->redirectProfessionalAccess($professionalId, 'La sesión del formulario venció. Volvé a intentarlo.');
+    }
+
+    $businessId = $this->getBusinessId();
+    $passwordInput = $_POST['access_password'] ?? '';
+    $passwordConfirmationInput = $_POST['access_password_confirmation'] ?? '';
+    $password = is_string($passwordInput) ? $passwordInput : '';
+    $passwordConfirmation = is_string($passwordConfirmationInput) ? $passwordConfirmationInput : '';
+    $passwordHash = null;
+
+    try {
+        $this->validateProfessionalAccessPassword($password, $passwordConfirmation);
+        $passwordHash = password_hash($password, PASSWORD_DEFAULT);
+
+        if ($passwordHash === false) {
+            throw new RuntimeException('No se pudo preparar la contraseña.');
+        }
+
+        $this->db->beginTransaction();
+        $access = $this->lockProfessionalAccess($businessId, $professionalId);
+
+        $update = $this->db->prepare("
+            UPDATE users
+            SET
+                password_hash = ?,
+                auth_version = auth_version + 1
+            WHERE id = ?
+              AND business_id = ?
+              AND role = 'professional'
+        ");
+        $update->execute([
+            $passwordHash,
+            (int) $access['user']['id'],
+            $businessId,
+        ]);
+
+        if ($update->rowCount() !== 1) {
+            throw new RuntimeException('No se pudo actualizar la contraseña.');
+        }
+
+        (new RememberToken($this->db))->revokeAllForUser((int) $access['user']['id']);
+        $this->db->commit();
+        $this->redirectProfessionalAccess(
+            $professionalId,
+            'Contraseña actualizada. Las sesiones anteriores se cerrarán en su próxima petición.',
+            true
+        );
+    } catch (RuntimeException $e) {
+        if ($this->db->inTransaction()) {
+            $this->db->rollBack();
+        }
+
+        $this->redirectProfessionalAccess($professionalId, $e->getMessage());
+    } catch (Throwable $e) {
+        if ($this->db->inTransaction()) {
+            $this->db->rollBack();
+        }
+
+        $this->redirectProfessionalAccess($professionalId, 'No se pudo actualizar la contraseña.');
+    } finally {
+        $password = '';
+        $passwordConfirmation = '';
+        $passwordHash = null;
+    }
+}
+
+private function validateProfessionalAccessPassword(string $password, string $confirmation): void
+{
+    $passwordLength = function_exists('mb_strlen')
+        ? mb_strlen($password)
+        : strlen($password);
+
+    if (trim($password) === '' || $passwordLength < 12) {
+        throw new RuntimeException('La contraseña debe tener al menos 12 caracteres.');
+    }
+
+    if (!hash_equals($password, $confirmation)) {
+        throw new RuntimeException('Las contraseñas no coinciden.');
+    }
+}
+
+private function lockProfessionalAccess(int $businessId, int $professionalId): array
+{
+    if ($professionalId <= 0) {
+        throw new RuntimeException('Profesional inválido.');
+    }
+
+    $professionalQuery = $this->db->prepare("
+        SELECT id, business_id, name, is_active, user_id
+        FROM professionals
+        WHERE id = ?
+          AND business_id = ?
+        LIMIT 1
+        FOR UPDATE
+    ");
+    $professionalQuery->execute([$professionalId, $businessId]);
+    $professional = $professionalQuery->fetch();
+
+    if (!$professional) {
+        throw new RuntimeException('El profesional no existe.');
+    }
+
+    $userId = (int) ($professional['user_id'] ?? 0);
+
+    if ($userId <= 0) {
+        throw new RuntimeException('El profesional no tiene una cuenta vinculada.');
+    }
+
+    $userQuery = $this->db->prepare("
+        SELECT id, business_id, email, role, status, auth_version
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        FOR UPDATE
+    ");
+    $userQuery->execute([$userId]);
+    $user = $userQuery->fetch();
+
+    if (
+        !$user
+        || (int) $user['business_id'] !== $businessId
+        || (string) $user['role'] !== 'professional'
+    ) {
+        throw new RuntimeException('La cuenta vinculada es administrativa o no pertenece al negocio.');
+    }
+
+    return [
+        'professional' => $professional,
+        'user' => $user,
+    ];
+}
+
+private function redirectProfessionalAccess(
+    int $professionalId,
+    string $message,
+    bool $success = false
+): void {
+    $_SESSION[$success ? 'flash_success' : 'flash_error'] = $message;
+
+    $location = APP_URL . '/professionals';
+
+    if ($professionalId > 0) {
+        $location = APP_URL . '/professionals/edit?id=' . $professionalId;
+    }
+
+    header('Location: ' . $location);
+    exit;
+}
+
 private function validateProfessionalData(array $input): array
 {
     $name = trim($input['name'] ?? '');
@@ -2283,10 +3540,19 @@ private function validateProfessionalData(array $input): array
 private function getProfessionalById(int $businessId, int $professionalId): ?array
 {
     $stmt = $this->db->prepare("
-        SELECT *
-        FROM professionals
-        WHERE business_id = ?
-          AND id = ?
+        SELECT
+            p.*,
+            u.id AS access_user_id,
+            u.email AS access_email,
+            u.role AS access_role,
+            u.status AS access_status,
+            u.last_login_at AS access_last_login_at
+        FROM professionals p
+        LEFT JOIN users u
+            ON u.id = p.user_id
+            AND u.business_id = p.business_id
+        WHERE p.business_id = ?
+          AND p.id = ?
         LIMIT 1
     ");
 
@@ -2435,19 +3701,15 @@ private function unsetOtherOwners(int $businessId, ?int $exceptProfessionalId = 
 
 private function getBusinessId(): int
 {
-    $user = Auth::user();
+    $businessId = Auth::businessId();
 
-    if (!$user) {
-        return 1;
+    if ($businessId === null) {
+        http_response_code(403);
+        echo 'Acceso no permitido.';
+        exit;
     }
 
-    if (($user['role'] ?? '') === 'super_admin') {
-        return 1;
-    }
-
-    $businessId = (int) ($user['business_id'] ?? 0);
-
-    return $businessId > 0 ? $businessId : 1;
+    return $businessId;
 }
 
 private function getServiceAssignmentConflicts(
@@ -2508,10 +3770,16 @@ private function buildServiceConflictMessage(array $conflicts): string
 public function confirmedMessages(): void
 {
     Auth::requireLogin();
+    Auth::startSession();
 
-    $businessId = $this->getBusinessId();
+    $businessId = $this->getCurrentBusinessId();
+    $professionalId = $this->getCurrentProfessionalId();
 
-    $appointments = $this->getConfirmedAppointmentsPendingMessage($businessId);
+    $error = $_SESSION['flash_error'] ?? null;
+    $success = $_SESSION['flash_success'] ?? null;
+    unset($_SESSION['flash_error'], $_SESSION['flash_success']);
+
+    $appointments = $this->getApprovedAppointmentsPendingMessage($businessId, $professionalId);
 
     require __DIR__ . '/../views/admin/confirmed_messages.php';
 }
@@ -2523,11 +3791,12 @@ public function confirmedMessagesBulk(): void
 
     $csrfToken = $_POST['csrf_token'] ?? null;
 
-    if (!Auth::validateCsrfToken($csrfToken)) {
-        $this->redirectWithError('La sesión del formulario venció. Volvé a intentarlo.');
+    if (!is_string($csrfToken) || !Auth::validateCsrfToken($csrfToken)) {
+        $this->redirectConfirmationWithError('La sesión del formulario venció. Volvé a intentarlo.');
     }
 
-    $businessId = $this->getBusinessId();
+    $businessId = $this->getCurrentBusinessId();
+    $professionalId = $this->getCurrentProfessionalId();
 
     $appointmentIds = $_POST['appointment_ids'] ?? [];
 
@@ -2538,55 +3807,61 @@ public function confirmedMessagesBulk(): void
     $appointmentIds = array_values(array_unique(array_filter(array_map('intval', $appointmentIds))));
 
     if (empty($appointmentIds)) {
-        $this->redirectWithError('Seleccioná al menos un turno confirmado.');
+        $this->redirectConfirmationWithError('Seleccioná al menos un turno aprobado.');
     }
 
-    $appointments = $this->getConfirmedAppointmentsByIds($businessId, $appointmentIds);
+    $appointments = $this->getApprovedAppointmentsByIds(
+        $businessId,
+        $appointmentIds,
+        $professionalId
+    );
+
+    if (count($appointments) !== count($appointmentIds)) {
+        $this->redirectConfirmationWithError('Uno o más turnos no están disponibles para esta cuenta.');
+    }
 
     require __DIR__ . '/../views/admin/confirmed_messages_bulk.php';
 }
 
-public function sendConfirmedWhatsApp(): void
+public function openWhatsApp(): void
 {
     Auth::requireLogin();
     Auth::startSession();
 
     $csrfToken = $_POST['csrf_token'] ?? null;
 
-    if (!Auth::validateCsrfToken($csrfToken)) {
-        $this->redirectWithError('La sesión del formulario venció. Volvé a intentarlo.');
+    if (!is_string($csrfToken) || !Auth::validateCsrfToken($csrfToken)) {
+        $this->redirectConfirmationWithError('La sesión del formulario venció. Volvé a intentarlo.');
     }
 
-    $businessId = $this->getBusinessId();
+    $businessId = $this->getCurrentBusinessId();
+    $professionalId = $this->getCurrentProfessionalId();
     $appointmentId = (int) ($_POST['appointment_id'] ?? 0);
 
     if ($appointmentId <= 0) {
-        $this->redirectWithError('Turno inválido.');
+        $this->redirectConfirmationWithError('Turno inválido.');
     }
 
-    $appointment = $this->getAppointmentForConfirmedMessage($businessId, $appointmentId);
+    $appointment = $this->getAppointmentForWhatsApp(
+        $businessId,
+        $appointmentId,
+        $professionalId
+    );
 
     if (!$appointment) {
-        $this->redirectWithError('No se encontró el turno confirmado.');
+        $this->redirectConfirmationWithError('No se encontró el turno aprobado.');
     }
 
-    if ($appointment['status'] !== 'confirmed') {
-        $this->redirectWithError('Sólo se puede enviar mensaje de confirmación a turnos confirmados.');
+    if ($appointment['status'] !== 'approved') {
+        $this->redirectConfirmationWithError('Sólo se puede preparar el mensaje de turnos aprobados.');
     }
 
     $messageBody = $this->buildConfirmedAppointmentMessage($appointment);
 
-    $this->logManualAppointmentMessage(
-        $businessId,
-        $appointment,
-        'appointment_confirmed',
-        $messageBody
-    );
-
     $phone = $this->formatPhoneForWhatsApp($appointment['customer_phone']);
 
     if ($phone === '') {
-        $this->redirectWithError('El cliente no tiene un WhatsApp válido.');
+        $this->redirectConfirmationWithError('El cliente no tiene un WhatsApp válido.');
     }
 
     $whatsappUrl = 'https://wa.me/' . $phone . '?text=' . urlencode($messageBody);
@@ -2595,8 +3870,116 @@ public function sendConfirmedWhatsApp(): void
     exit;
 }
 
-private function getConfirmedAppointmentsPendingMessage(int $businessId): array
+public function markWhatsAppSent(): void
 {
+    Auth::requireLogin();
+    Auth::startSession();
+
+    $csrfToken = $_POST['csrf_token'] ?? null;
+
+    if (!is_string($csrfToken) || !Auth::validateCsrfToken($csrfToken)) {
+        $this->redirectConfirmationWithError('La sesión del formulario venció. Volvé a intentarlo.');
+    }
+
+    $businessId = $this->getCurrentBusinessId();
+    $professionalId = $this->getCurrentProfessionalId();
+    $appointmentId = (int) ($_POST['appointment_id'] ?? 0);
+
+    if ($appointmentId <= 0) {
+        $this->redirectConfirmationWithError('Turno inválido.');
+    }
+
+    try {
+        $this->db->beginTransaction();
+
+        $lockSql = "
+            SELECT status
+            FROM appointments
+            WHERE id = ? AND business_id = ?
+        ";
+        $lockParams = [$appointmentId, $businessId];
+
+        if ($professionalId !== null) {
+            $lockSql .= " AND professional_id = ?";
+            $lockParams[] = $professionalId;
+        }
+
+        $lockSql .= " FOR UPDATE";
+
+        $lock = $this->db->prepare($lockSql);
+        $lock->execute($lockParams);
+        $row = $lock->fetch();
+
+        if (!$row || $row['status'] !== 'approved') {
+            $this->db->rollBack();
+            $this->redirectConfirmationWithError('El turno ya no está pendiente de confirmación.');
+        }
+
+        $appointment = $this->getAppointmentForWhatsApp(
+            $businessId,
+            $appointmentId,
+            $professionalId
+        );
+
+        if (!$appointment) {
+            throw new RuntimeException('No se encontró el turno aprobado.');
+        }
+
+        $this->logManualAppointmentMessage(
+            $businessId,
+            $appointment,
+            'appointment_confirmed',
+            $this->buildConfirmedAppointmentMessage($appointment)
+        );
+
+        $updateSql = "
+            UPDATE appointments
+            SET status = 'confirmed'
+            WHERE id = ? AND business_id = ? AND status = 'approved'
+        ";
+        $updateParams = [$appointmentId, $businessId];
+
+        if ($professionalId !== null) {
+            $updateSql .= " AND professional_id = ?";
+            $updateParams[] = $professionalId;
+        }
+
+        $update = $this->db->prepare($updateSql);
+        $update->execute($updateParams);
+
+        if ($update->rowCount() !== 1) {
+            throw new RuntimeException('El estado del turno cambió durante la confirmación.');
+        }
+
+        $this->db->commit();
+        $_SESSION['flash_success'] = 'Envío manual registrado. El turno quedó confirmado.';
+        header('Location: ' . APP_URL . '/appointments/confirmed-messages');
+        exit;
+    } catch (Throwable $e) {
+        if ($this->db->inTransaction()) {
+            $this->db->rollBack();
+        }
+
+        $this->redirectConfirmationWithError('No se pudo registrar el envío. Volvé a intentarlo.');
+    }
+}
+
+private function redirectConfirmationWithError(string $message): void
+{
+    $_SESSION['flash_error'] = $message;
+    header('Location: ' . APP_URL . '/appointments/confirmed-messages');
+    exit;
+}
+
+private function getApprovedAppointmentsPendingMessage(
+    int $businessId,
+    ?int $professionalId = null
+): array
+{
+    $professionalScope = $professionalId !== null
+        ? ' AND a.professional_id = ?'
+        : '';
+
     $stmt = $this->db->prepare("
         SELECT
             a.id,
@@ -2620,28 +4003,33 @@ private function getConfirmedAppointmentsPendingMessage(int $businessId): array
             p.phone AS professional_phone
 
         FROM appointments a
-        INNER JOIN customers c ON c.id = a.customer_id
+        INNER JOIN customers c ON c.id = a.customer_id AND c.business_id = a.business_id
         INNER JOIN services s ON s.id = a.service_id
         LEFT JOIN professionals p ON p.id = a.professional_id
 
-        LEFT JOIN appointment_message_logs aml
-            ON aml.appointment_id = a.id
-            AND aml.message_type = 'appointment_confirmed'
-
         WHERE a.business_id = ?
-          AND a.status = 'confirmed'
-          AND aml.id IS NULL
-          AND a.start_at >= NOW()
+          AND a.status = 'approved'
+          {$professionalScope}
 
         ORDER BY a.start_at ASC
     ");
 
-    $stmt->execute([$businessId]);
+    $params = [$businessId];
+
+    if ($professionalId !== null) {
+        $params[] = $professionalId;
+    }
+
+    $stmt->execute($params);
 
     return $stmt->fetchAll();
 }
 
-private function getConfirmedAppointmentsByIds(int $businessId, array $appointmentIds): array
+private function getApprovedAppointmentsByIds(
+    int $businessId,
+    array $appointmentIds,
+    ?int $professionalId = null
+): array
 {
     $appointmentIds = array_values(array_unique(array_filter(array_map('intval', $appointmentIds))));
 
@@ -2650,6 +4038,9 @@ private function getConfirmedAppointmentsByIds(int $businessId, array $appointme
     }
 
     $placeholders = implode(',', array_fill(0, count($appointmentIds), '?'));
+    $professionalScope = $professionalId !== null
+        ? ' AND a.professional_id = ?'
+        : '';
 
     $stmt = $this->db->prepare("
         SELECT
@@ -2674,26 +4065,39 @@ private function getConfirmedAppointmentsByIds(int $businessId, array $appointme
             p.phone AS professional_phone
 
         FROM appointments a
-        INNER JOIN customers c ON c.id = a.customer_id
+        INNER JOIN customers c ON c.id = a.customer_id AND c.business_id = a.business_id
         INNER JOIN services s ON s.id = a.service_id
         LEFT JOIN professionals p ON p.id = a.professional_id
 
         WHERE a.business_id = ?
-          AND a.status = 'confirmed'
+          AND a.status = 'approved'
           AND a.id IN ($placeholders)
+          {$professionalScope}
 
         ORDER BY a.start_at ASC
     ");
 
     $params = array_merge([$businessId], $appointmentIds);
 
+    if ($professionalId !== null) {
+        $params[] = $professionalId;
+    }
+
     $stmt->execute($params);
 
     return $stmt->fetchAll();
 }
 
-private function getAppointmentForConfirmedMessage(int $businessId, int $appointmentId): ?array
+private function getAppointmentForWhatsApp(
+    int $businessId,
+    int $appointmentId,
+    ?int $professionalId = null
+): ?array
 {
+    $professionalScope = $professionalId !== null
+        ? ' AND a.professional_id = ?'
+        : '';
+
     $stmt = $this->db->prepare("
         SELECT
             a.id,
@@ -2720,24 +4124,65 @@ private function getAppointmentForConfirmedMessage(int $businessId, int $appoint
             b.whatsapp AS business_whatsapp
 
         FROM appointments a
-        INNER JOIN customers c ON c.id = a.customer_id
+        INNER JOIN customers c ON c.id = a.customer_id AND c.business_id = a.business_id
         INNER JOIN services s ON s.id = a.service_id
         INNER JOIN businesses b ON b.id = a.business_id
         LEFT JOIN professionals p ON p.id = a.professional_id
 
         WHERE a.business_id = ?
           AND a.id = ?
+          {$professionalScope}
         LIMIT 1
     ");
 
-    $stmt->execute([
-        $businessId,
-        $appointmentId
-    ]);
+    $params = [$businessId, $appointmentId];
+
+    if ($professionalId !== null) {
+        $params[] = $professionalId;
+    }
+
+    $stmt->execute($params);
 
     $appointment = $stmt->fetch();
 
     return $appointment ?: null;
+}
+
+private function canCancelAppointmentStatus(?string $status): bool
+{
+    return in_array($status, [
+        'pending_approval',
+        'pending_deposit',
+        'approved',
+        'confirmed',
+        'rescheduled',
+        'consultation',
+    ], true);
+}
+
+private function buildCancellationWhatsAppUrl(array $appointment): ?string
+{
+    $phone = $this->formatPhoneForWhatsApp($appointment['customer_phone'] ?? null);
+
+    if (!preg_match('/^\d{10,15}$/', $phone)) {
+        return null;
+    }
+
+    return 'https://wa.me/' . $phone . '?text=' . rawurlencode(
+        $this->buildCancelledAppointmentMessage($appointment)
+    );
+}
+
+private function buildCancelledAppointmentMessage(array $appointment): string
+{
+    $customerName = trim((string) ($appointment['customer_name'] ?? ''));
+    $serviceName = trim((string) ($appointment['service_name'] ?? ''));
+    $timestamp = strtotime((string) ($appointment['start_at'] ?? ''));
+    $date = $timestamp ? date('d/m/Y', $timestamp) : '-';
+    $time = $timestamp ? date('H:i', $timestamp) : '-';
+
+    return "Hola {$customerName}, quedó cancelado tu turno de {$serviceName} del {$date} a las {$time}. "
+        . 'Si querés coordinar otro turno, escribime.';
 }
 
 private function buildConfirmedAppointmentMessage(array $appointment): string
@@ -2791,11 +4236,6 @@ private function logManualAppointmentMessage(
         )
         VALUES
         (?, ?, ?, ?, ?, 'whatsapp', ?, ?, ?, NOW())
-        ON DUPLICATE KEY UPDATE
-            user_id = VALUES(user_id),
-            phone = VALUES(phone),
-            message_body = VALUES(message_body),
-            sent_manually_at = NOW()
     ");
 
     $stmt->execute([
