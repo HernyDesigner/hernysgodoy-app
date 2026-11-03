@@ -68,8 +68,7 @@ class Availability
             $end = strtotime($date . ' ' . $interval['end']);
 
             while (($current + ($duration * 60)) <= $end) {
-                // Omitir horarios cuyo inicio ya pasó.
-                if ($current <= time()) {
+                if ($excludeAppointmentId === null && $current <= time()) {
                     $current += $this->slotInterval * 60;
                     continue;
                 }

@@ -485,11 +485,24 @@
             $this->redirectEditWithError($appointmentId, 'El servicio seleccionado no existe.');
         }
 
-        $startAt = $date . ' ' . $time . ':00';
+        $businessTimeZone = new DateTimeZone('America/Argentina/Buenos_Aires');
+        $startInput = $date . ' ' . $time;
+        $appointmentStart = DateTimeImmutable::createFromFormat(
+            '!Y-m-d H:i',
+            $startInput,
+            $businessTimeZone
+        );
+        $startErrors = DateTimeImmutable::getLastErrors();
 
-        if (strtotime($startAt) === false) {
+        if (
+            !$appointmentStart
+            || ($startErrors !== false && ($startErrors['warning_count'] > 0 || $startErrors['error_count'] > 0))
+            || $appointmentStart->format('Y-m-d H:i') !== $startInput
+        ) {
             $this->redirectEditWithError($appointmentId, 'La fecha u hora no es válida.');
         }
+
+        $startAt = $appointmentStart->format('Y-m-d H:i:s');
 
         $duration = (int) $service['duration_default'];
 
@@ -497,32 +510,9 @@
             $duration = 60;
         }
 
-        $endAt = date('Y-m-d H:i:s', strtotime($startAt . " + {$duration} minutes"));
-
-        if ($status !== 'cancelled') {
-            $availability = new Availability();
-
-            $availableSlots = $availability->getAvailableSlots(
-                $businessId,
-                $serviceId,
-                $date,
-                $appointmentId,
-                $professionalId
-            );
-
-            $slotAvailable = false;
-
-            foreach ($availableSlots as $slot) {
-                if ($slot['time'] === substr($time, 0, 5)) {
-                    $slotAvailable = true;
-                    break;
-                }
-            }
-
-            if (!$slotAvailable) {
-                $this->redirectEditWithError($appointmentId, 'Ese horario ya no está disponible para el profesional seleccionado.');
-            }
-        }
+        $endAt = $appointmentStart
+            ->modify("+{$duration} minutes")
+            ->format('Y-m-d H:i:s');
 
         try {
             $this->db->beginTransaction();
@@ -549,11 +539,37 @@
             }
 
             $currentStatus = (string) $current['status'];
-            $currentStartTimestamp = strtotime((string) $current['start_at']);
-            $requestedStartTimestamp = strtotime($startAt);
-            $scheduleChanged = $currentStartTimestamp === false
-                || $requestedStartTimestamp === false
-                || date('Y-m-d H:i', $currentStartTimestamp) !== date('Y-m-d H:i', $requestedStartTimestamp);
+            $currentStart = new DateTimeImmutable((string) $current['start_at'], $businessTimeZone);
+            $scheduleChanged = $currentStart->format('Y-m-d H:i') !== $appointmentStart->format('Y-m-d H:i');
+
+            if ($scheduleChanged && $appointmentStart <= new DateTimeImmutable('now', $businessTimeZone)) {
+                throw new RuntimeException('No podés reprogramar un turno a una fecha u hora que ya pasó.');
+            }
+
+            if ($status !== 'cancelled') {
+                $availability = new Availability();
+
+                $availableSlots = $availability->getAvailableSlots(
+                    $businessId,
+                    $serviceId,
+                    $date,
+                    $appointmentId,
+                    $professionalId
+                );
+
+                $slotAvailable = false;
+
+                foreach ($availableSlots as $slot) {
+                    if ($slot['time'] === substr($time, 0, 5)) {
+                        $slotAvailable = true;
+                        break;
+                    }
+                }
+
+                if (!$slotAvailable) {
+                    throw new RuntimeException('Ese horario ya no está disponible para el profesional seleccionado.');
+                }
+            }
 
             if ($currentStatus === 'confirmed' && $status === 'confirmed' && $scheduleChanged) {
                 $status = 'approved';
