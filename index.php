@@ -6,6 +6,7 @@ error_reporting(E_ALL);
 
 require __DIR__ . '/config/app.php';
 require __DIR__ . '/core/Database.php';
+require __DIR__ . '/core/LoginRateLimiter.php';
 require __DIR__ . '/core/Auth.php';
 require __DIR__ . '/core/Availability.php';
 require __DIR__ . '/controllers/AuthController.php';
@@ -13,6 +14,7 @@ require __DIR__ . '/controllers/AdminController.php';
 require __DIR__ . '/controllers/PublicBookingController.php';
 
 Auth::startSession();
+Auth::check();
 
 $route = $_GET['route'] ?? '';
 
@@ -23,6 +25,46 @@ $publicBookingController = new PublicBookingController();
 if (preg_match('#^reservas/([a-z0-9-]+)$#', $route, $matches)) {
     $publicBookingController->show($matches[1]);
     exit;
+}
+
+if (!in_array($route, ['login', 'logout'], true)) {
+    $appointmentRoutes = [
+        '',
+        'dashboard',
+        'calendar',
+        'appointments/create',
+        'appointments/store',
+        'appointments/edit',
+        'appointments/update',
+        'appointments/today',
+        'appointments/week',
+        'appointments/pending-approval',
+        'appointments/pending-deposit',
+        'appointments/approve',
+        'appointments/approved',
+        'appointments/confirmed',
+        'appointments/rescheduled',
+        'appointments/consultation',
+        'appointments/confirmed-messages',
+        'appointments/confirmed-messages/bulk',
+        'appointments/open-whatsapp',
+        'appointments/mark-whatsapp-sent',
+    ];
+
+    $scheduleRoutes = [
+        'schedule',
+        'schedule/update-hours',
+        'schedule/exceptions/store',
+        'schedule/exceptions/delete',
+    ];
+
+    if (in_array($route, $appointmentRoutes, true)) {
+        Auth::requireAppointmentAccess();
+    } elseif (in_array($route, $scheduleRoutes, true)) {
+        Auth::requireScheduleAccess();
+    } else {
+        Auth::requireAdministrativeAccess();
+    }
 }
 
 switch ($route) {
@@ -94,6 +136,11 @@ switch ($route) {
         break;
 
     case 'professionals/store':
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            header('Location: ' . APP_URL . '/professionals');
+            exit;
+        }
+
         $adminController->storeProfessional();
         break;
 
@@ -102,7 +149,39 @@ switch ($route) {
         break;
 
     case 'professionals/update':
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            header('Location: ' . APP_URL . '/professionals');
+            exit;
+        }
+
         $adminController->updateProfessional();
+        break;
+
+    case 'professionals/access/create':
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            header('Location: ' . APP_URL . '/professionals');
+            exit;
+        }
+
+        $adminController->createProfessionalAccess();
+        break;
+
+    case 'professionals/access/status':
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            header('Location: ' . APP_URL . '/professionals');
+            exit;
+        }
+
+        $adminController->updateProfessionalAccessStatus();
+        break;
+
+    case 'professionals/access/password':
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            header('Location: ' . APP_URL . '/professionals');
+            exit;
+        }
+
+        $adminController->updateProfessionalAccessPassword();
         break;
 
     case 'schedule':
@@ -178,13 +257,17 @@ switch ($route) {
         $adminController->appointmentsPendingDeposit();
         break;
 
-    case 'appointments/confirm':
+    case 'appointments/approve':
         if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
             header('Location: ' . APP_URL . '/dashboard');
             exit;
         }
 
-        $adminController->confirmAppointment();
+        $adminController->approveAppointment();
+        break;
+
+    case 'appointments/approved':
+        $adminController->appointmentsApproved();
         break;
     
     case 'appointments/confirmed':
@@ -207,8 +290,22 @@ case 'appointments/confirmed-messages/bulk':
     $adminController->confirmedMessagesBulk();
     break;
 
-case 'appointments/send-confirmed-whatsapp':
-    $adminController->sendConfirmedWhatsApp();
+case 'appointments/open-whatsapp':
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        header('Location: ' . APP_URL . '/appointments/confirmed-messages');
+        exit;
+    }
+
+    $adminController->openWhatsApp();
+    break;
+
+case 'appointments/mark-whatsapp-sent':
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        header('Location: ' . APP_URL . '/appointments/confirmed-messages');
+        exit;
+    }
+
+    $adminController->markWhatsAppSent();
     break;
 
     default:
